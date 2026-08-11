@@ -30,6 +30,10 @@ type Task struct {
 	Cue       *CueTimeline
 	Config    Config
 
+	// CreatedAt separates "freshly installed in the slot" from "has been watched for a
+	// while", which is how the service tells a swap fight from an episode switch.
+	CreatedAt time.Time
+
 	LastSentSegment int
 
 	initMu  sync.RWMutex
@@ -50,6 +54,7 @@ type Task struct {
 }
 
 func NewTask(id string, fileID string, audio int, sourceURL string, probe ProbeInfo, cue *CueTimeline, conf Config) (*Task, error) {
+	now := time.Now().UTC()
 	task := &Task{
 		ID:              id,
 		FileID:          fileID,
@@ -58,8 +63,9 @@ func NewTask(id string, fileID string, audio int, sourceURL string, probe ProbeI
 		Probe:           probe,
 		Cue:             cue,
 		Config:          conf.normalized(),
+		CreatedAt:       now,
 		LastSentSegment: -1,
-		lastActive:      time.Now().UTC(),
+		lastActive:      now,
 	}
 
 	runner, err := newPipelineRunner(task, audio)

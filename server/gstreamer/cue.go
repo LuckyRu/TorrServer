@@ -72,12 +72,14 @@ type ebmlElement struct {
 
 func (e ebmlElement) endOffset() uint64 { return uint64(e.dataOffset) + e.size }
 
-func readMatroskaCueTimeline(sourceURL string, contentLength int64, durationNS int64) *CueTimeline {
+func readMatroskaCueTimeline(ctx context.Context, sourceURL string, contentLength int64, durationNS int64) *CueTimeline {
 	if sourceURL == "" || durationNS <= 0 {
 		return nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	// Derived from the caller's context so a client that disconnects stops paying for
+	// range reads it will never use; the timeout still caps a slow torrent.
+	ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
 
 	prefixLength := matroskaPrefixLength
