@@ -1127,8 +1127,8 @@ func (r *gstRunner) freezeBusGeneration(generation uint64) {
 		return
 	}
 
-	r.task.mu.Lock()
-	defer r.task.mu.Unlock()
+	r.task.lockBlocking()
+	defer r.task.unlock()
 	if r.watchGeneration.Load() != generation || r.task.disposed.Load() || r.task.runner != r {
 		return
 	}

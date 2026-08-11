@@ -39,8 +39,9 @@ type Task struct {
 	activeMu   sync.RWMutex
 	lastActive time.Time
 
-	mu     sync.Mutex
-	runner pipelineRunner
+	gateOnce sync.Once
+	gate     chan struct{}
+	runner   pipelineRunner
 
 	subtitleMu     sync.RWMutex
 	subtitleStores map[int]*subtitleStore
@@ -67,6 +68,59 @@ func NewTask(id string, fileID string, audio int, sourceURL string, probe ProbeI
 	}
 	task.runner = runner
 	return task, nil
+}
+
+// gateChan lazily builds the task gate so a zero-value Task stays usable in tests.
+func (t *Task) gateChan() chan struct{} {
+	t.gateOnce.Do(func() {
+		t.gate = make(chan struct{}, 1)
+	})
+	return t.gate
+}
+
+// lock acquires the task gate and gives up as soon as the request is cancelled.
+//
+// A plain mutex would make a cancelled request wait its turn and then run a full seek
+// nobody is waiting for, so a scrubbing player could keep the task busy for as long as
+// it kept scrubbing.
+func (t *Task) lock(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	gate := t.gateChan()
+	select {
+	case gate <- struct{}{}:
+		return nil
+	default:
+	}
+
+	select {
+	case gate <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// lockBlocking is for callers without a request context: shutdown and cleanup.
+func (t *Task) lockBlocking() {
+	t.gateChan() <- struct{}{}
+}
+
+// tryLock acquires the gate only if it is free, for callers that would rather skip the
+// task than wait behind an in-flight segment.
+func (t *Task) tryLock() bool {
+	select {
+	case t.gateChan() <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (t *Task) unlock() {
+	<-t.gateChan()
 }
 
 func (t *Task) UpdateLastActive() {
@@ -178,8 +232,10 @@ func (t *Task) hlsVariant() (HLSVariantInfo, bool) {
 }
 
 func (t *Task) EnsureInit(ctx context.Context, audio int, startIndex int) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	if err := t.lock(ctx); err != nil {
+		return err
+	}
+	defer t.unlock()
 
 	if startIndex < 0 {
 		startIndex = 0
@@ -201,13 +257,18 @@ func (t *Task) EnsureInit(ctx context.Context, audio int, startIndex int) error 
 	return err
 }
 
+// WithSegment runs consume while the task lock is held, so consume borrows the mp4
+// reader arena and must not block. Anything that writes to the network wants
+// LeaseSegment instead.
 func (t *Task) WithSegment(ctx context.Context, index int, audio int, consume func(Segment) error) error {
 	if consume == nil {
 		return errors.New("nil segment consumer")
 	}
 
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	if err := t.lock(ctx); err != nil {
+		return err
+	}
+	defer t.unlock()
 
 	seg, err := t.segmentLocked(ctx, index, audio)
 	if err != nil {
@@ -219,6 +280,29 @@ func (t *Task) WithSegment(ctx context.Context, index int, audio int, consume fu
 	return consume(seg)
 }
 
+// LeaseSegment returns an owned copy of the segment, taken while the lock is held.
+//
+// The caller writes it out after the lock is gone, so a player that stops reading its
+// response can no longer stall every other request on this task.
+func (t *Task) LeaseSegment(ctx context.Context, index int, audio int) (*SegmentLease, error) {
+	if err := t.lock(ctx); err != nil {
+		return nil, err
+	}
+	defer t.unlock()
+
+	seg, err := t.segmentLocked(ctx, index, audio)
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if seg.Empty() {
+		return nil, ErrSegmentNotReady
+	}
+	return leaseSegment(seg), nil
+}
+
 func (t *Task) segmentLocked(ctx context.Context, index int, audio int) (Segment, error) {
 	if t.runner == nil {
 		return Segment{}, ErrTaskNotFound
@@ -228,11 +312,11 @@ func (t *Task) segmentLocked(ctx context.Context, index int, audio int) (Segment
 	}
 
 	if t.runner.IsFrozen() {
-		if err := t.seekToSegmentLocked(index); err != nil {
+		if err := t.seekToSegmentLocked(ctx, index); err != nil {
 			return Segment{}, err
 		}
 	} else if t.LastSentSegment == -1 && index > 0 {
-		if err := t.seekToSegmentLocked(index); err != nil {
+		if err := t.seekToSegmentLocked(ctx, index); err != nil {
 			return Segment{}, err
 		}
 	} else if t.LastSentSegment != -1 && t.LastSentSegment != index {
@@ -258,7 +342,7 @@ func (t *Task) segmentLocked(ctx context.Context, index int, audio int) (Segment
 				}
 			}
 			if seekRequired {
-				if err := t.seekToSegmentLocked(index); err != nil {
+				if err := t.seekToSegmentLocked(ctx, index); err != nil {
 					return Segment{}, err
 				}
 			}
@@ -274,7 +358,12 @@ func (t *Task) segmentLocked(ctx context.Context, index int, audio int) (Segment
 	return seg, nil
 }
 
-func (t *Task) seekToSegmentLocked(index int) error {
+// seekToSegmentLocked checks ctx first: a seek is the expensive half of a segment
+// request, and there is no point running one for a request that is already gone.
+func (t *Task) seekToSegmentLocked(ctx context.Context, index int) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if cue, ok := t.Cue.Segment(index); ok {
 		if !t.runner.Seek(float64(cue.StartNS) / 1_000_000_000) {
 			return ErrSegmentNotReady
@@ -322,14 +411,14 @@ func (t *Task) validateSegmentIndex(index int) error {
 const maxSegmentCatchupSeconds = 60
 
 func (t *Task) Frozen() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.lockBlocking()
+	defer t.unlock()
 	t.freezeLocked()
 }
 
 func (t *Task) FreezeIfInactive(cutoff time.Time) bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.lockBlocking()
+	defer t.unlock()
 
 	t.activeMu.Lock()
 	defer t.activeMu.Unlock()
@@ -355,8 +444,8 @@ func (t *Task) Dispose() {
 		return
 	}
 
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.lockBlocking()
+	defer t.unlock()
 	if t.runner != nil {
 		t.runner.Dispose()
 		t.runner = nil
@@ -369,8 +458,8 @@ func (t *Task) IsDisposed() bool {
 }
 
 func (t *Task) IsFrozen() bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.lockBlocking()
+	defer t.unlock()
 
 	if t.disposed.Load() || t.runner == nil {
 		return false
