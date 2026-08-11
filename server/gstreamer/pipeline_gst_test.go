@@ -1520,3 +1520,79 @@ func TestTaskLeaseSegmentSkipsSeekForCancelledRequest(t *testing.T) {
 		t.Fatalf("cancelled requests performed %d seeks, want 0", got)
 	}
 }
+
+// Everything a task can be asked to do, at once, the way a player plus the cleanup
+// loop plus the bus watcher would. Errors are expected once Dispose lands; what this
+// asserts is that the gate keeps LastSentSegment and the runner handle consistent, that
+// nothing panics, and that the whole thing finishes rather than deadlocking. Worth
+// running under -race, where it is the main coverage of the gate's lock discipline.
+func TestTaskConcurrentOperationsUnderGate(t *testing.T) {
+	payload := []byte("segment-payload")
+	task := &Task{
+		LastSentSegment: -1,
+		Config:          Config{SegmentSeconds: 6}.normalized(),
+		Probe:           ProbeInfo{DurationNS: int64(time.Hour)},
+		runner: &fakePipelineRunner{
+			getSegment: func(ctx context.Context, _ int, _ int) (Segment, error) {
+				if err := ctx.Err(); err != nil {
+					return Segment{}, err
+				}
+				return Segment{Header: []byte("hdr"), Payloads: [][]byte{payload}}, nil
+			},
+		},
+	}
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	worker := func(fn func(i int)) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				fn(i)
+			}
+		}()
+	}
+
+	// Segment requests, some of which the client abandons mid-flight.
+	for w := range 4 {
+		worker(func(i int) {
+			ctx, cancel := context.WithCancel(context.Background())
+			if (i+w)%3 == 0 {
+				cancel()
+			} else {
+				defer cancel()
+			}
+			if lease, err := task.LeaseSegment(ctx, (i+w)%20, 0); err == nil {
+				lease.Release()
+			}
+		})
+	}
+
+	worker(func(i int) { _ = task.EnsureInit(context.Background(), 0, i%5) })
+	worker(func(int) { _ = task.IsFrozen() })
+	worker(func(int) { task.UpdateLastActive() })
+	worker(func(int) { task.FreezeIfInactive(time.Now().UTC().Add(time.Hour)) })
+
+	time.Sleep(150 * time.Millisecond)
+	task.Dispose()
+	// Keep hammering a disposed task: nothing here may panic on the nil runner.
+	time.Sleep(50 * time.Millisecond)
+
+	close(stop)
+	wg.Wait()
+
+	if !task.IsDisposed() {
+		t.Fatal("task should be disposed")
+	}
+	if !task.tryLock() {
+		t.Fatal("gate is still held after all workers finished")
+	}
+	task.unlock()
+}
