@@ -2,8 +2,10 @@ package web
 
 import (
 	"net"
+	"net/http"
 	"os"
 	"sort"
+	"time"
 
 	gstreamer "server/gstreamer/bridge"
 	"server/netbind"
@@ -142,7 +144,14 @@ func Start() {
 			addr := netbind.Addr(ip, settings.Port)
 			go func(addr string) {
 				log.TLogln("Start http server at", addr)
-				waitChan <- route.Run(addr)
+				// ReadHeaderTimeout only; a WriteTimeout would cut off /stream downloads.
+				// Per-response deadlines are set by the handlers that need them.
+				srv := &http.Server{
+					Addr:              addr,
+					Handler:           route,
+					ReadHeaderTimeout: 15 * time.Second,
+				}
+				waitChan <- srv.ListenAndServe()
 			}(addr)
 		}
 	}()
