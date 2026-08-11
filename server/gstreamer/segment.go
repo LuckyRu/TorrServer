@@ -2,7 +2,10 @@
 
 package gstreamer
 
-import "io"
+import (
+	"io"
+	"sync"
+)
 
 type Segment struct {
 	Header       []byte
@@ -11,6 +14,67 @@ type Segment struct {
 	EndNS        uint64
 	StartSeconds float64
 	EndSeconds   float64
+}
+
+// Buffers above this size are dropped instead of returned to the pool so that one
+// oversized segment does not pin memory for the lifetime of the process.
+const maxPooledSegmentBytes = 8 << 20
+
+// SegmentLease is an owned, contiguous copy of a Segment.
+//
+// Segment.Payloads alias the mp4BoxReader arena, which ReleaseSegment recycles, so a
+// Segment is only valid while the task lock is held. A lease decouples the two: the
+// copy is taken under the lock, the write to the network happens without it.
+type SegmentLease struct {
+	buf []byte
+}
+
+var segmentLeasePool = sync.Pool{New: func() any { return new(SegmentLease) }}
+
+// leaseSegment must be called while the task lock still guards seg.
+func leaseSegment(seg Segment) *SegmentLease {
+	total := seg.Len()
+
+	lease, _ := segmentLeasePool.Get().(*SegmentLease)
+	if lease == nil {
+		lease = new(SegmentLease)
+	}
+	if cap(lease.buf) < total {
+		lease.buf = make([]byte, total)
+	}
+	lease.buf = lease.buf[:total]
+
+	offset := copy(lease.buf, seg.Header)
+	for _, payload := range seg.Payloads {
+		offset += copy(lease.buf[offset:], payload)
+	}
+	return lease
+}
+
+func (l *SegmentLease) Bytes() []byte {
+	if l == nil {
+		return nil
+	}
+	return l.buf
+}
+
+func (l *SegmentLease) Len() int {
+	if l == nil {
+		return 0
+	}
+	return len(l.buf)
+}
+
+func (l *SegmentLease) Release() {
+	if l == nil {
+		return
+	}
+	if cap(l.buf) > maxPooledSegmentBytes {
+		l.buf = nil
+	} else {
+		l.buf = l.buf[:0]
+	}
+	segmentLeasePool.Put(l)
 }
 
 func (s Segment) Len() int {
