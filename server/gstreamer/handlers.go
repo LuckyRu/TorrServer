@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
 	"net/url"
@@ -371,13 +372,15 @@ func (s *Service) segment(c *gin.Context) {
 		}
 	}
 
-	err = task.WithSegment(c.Request.Context(), index, audio, func(seg Segment) error {
-		if seg.Empty() {
-			return ErrSegmentNotReady
-		}
-		return writeSegment(c, seg)
-	})
+	lease, err := task.LeaseSegment(c.Request.Context(), index, audio)
 	if err != nil {
+		gstTaskFailure(task, fmt.Sprintf("segment %d response", index), err)
+		abortWithRequestError(c, http.StatusBadGateway, err)
+		return
+	}
+	defer lease.Release()
+
+	if err := writeSegmentBytes(c, lease.Bytes()); err != nil {
 		gstTaskFailure(task, fmt.Sprintf("segment %d response", index), err)
 		abortWithRequestError(c, http.StatusBadGateway, err)
 		return
@@ -442,17 +445,26 @@ func buildSubtitlePlaylist(task *Task, trackIndex int) string {
 	return result.String()
 }
 
-func writeSegment(c *gin.Context, seg Segment) error {
-	totalLength := int64(seg.Len())
+// A player that stops reading its response (paused, backgrounded, dead Wi-Fi without a
+// RST) would otherwise pin this goroutine until TCP keepalive gives up, and the server
+// sets no WriteTimeout because /stream serves long downloads on the same listener.
+const segmentWriteTimeout = 30 * time.Second
+
+func writeSegmentBytes(c *gin.Context, data []byte) error {
+	totalLength := int64(len(data))
 
 	c.Header("Content-Type", "video/mp4")
 	c.Header("Accept-Ranges", "bytes")
 
+	controller := http.NewResponseController(c.Writer)
+	if err := controller.SetWriteDeadline(time.Now().Add(segmentWriteTimeout)); err == nil {
+		defer func() { _ = controller.SetWriteDeadline(time.Time{}) }()
+	}
+
 	rangeHeader := c.GetHeader("Range")
 	if rangeHeader == "" {
 		c.Header("Content-Length", strconv.FormatInt(totalLength, 10))
-		_, err := seg.WriteTo(c.Writer)
-		return err
+		return writeAll(c, data)
 	}
 
 	start, end, ok := parseSingleRange(rangeHeader, totalLength)
@@ -467,7 +479,21 @@ func writeSegment(c *gin.Context, seg Segment) error {
 	c.Header("Content-Length", strconv.FormatInt(length, 10))
 	c.Status(http.StatusPartialContent)
 
-	return seg.WriteRange(c.Writer, start, length)
+	return writeAll(c, data[start:start+length])
+}
+
+func writeAll(c *gin.Context, data []byte) error {
+	if len(data) == 0 {
+		return nil
+	}
+	written, err := c.Writer.Write(data)
+	if err != nil {
+		return err
+	}
+	if written != len(data) {
+		return io.ErrShortWrite
+	}
+	return nil
 }
 
 func parseSingleRange(header string, totalLength int64) (int64, int64, bool) {
