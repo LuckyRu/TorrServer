@@ -82,7 +82,7 @@ func (s *Service) master(c *gin.Context) {
 	fileID := firstNonEmpty(c.Query("index"), c.Query("id"), c.Query("fileID"))
 	audio := parseQueryInt(c, "audio", 0)
 
-	task, err := s.GetOrAdd(hash, fileID, audio)
+	task, err := s.GetOrAdd(c.Request.Context(), hash, fileID, audio)
 	if err != nil {
 		gstSourceFailure(hash, fileID, audio, "master task creation", err)
 		abortWithSourceError(c, err)
@@ -600,8 +600,18 @@ func startSegmentIndex(seconds int, segmentSeconds int, count int) int {
 }
 
 func abortWithSourceError(c *gin.Context, err error) {
+	if errors.Is(err, context.Canceled) || c.Request.Context().Err() != nil {
+		return
+	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		c.String(http.StatusGatewayTimeout, err.Error())
+		return
+	}
+	// Contention for the hash's single task slot, not a broken source: tell the player
+	// to come back rather than reporting the upstream as bad.
+	if errors.Is(err, ErrTaskBusy) {
+		c.Header("Retry-After", "1")
+		c.String(http.StatusServiceUnavailable, err.Error())
 		return
 	}
 	c.String(http.StatusBadGateway, err.Error())

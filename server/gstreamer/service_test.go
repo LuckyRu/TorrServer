@@ -51,6 +51,134 @@ func newTrackedTask(id string, lastActive time.Time) (*Task, *trackingRunner) {
 	}, runner
 }
 
+// A second client asking for a different file of the same torrent must not be able to
+// tear down a task that was itself just installed and is still serving: that is the
+// swap fight that used to spin GetOrAdd forever. It has to give up, and give up fast.
+func TestGetOrAddDefendsFreshlyInstalledTaskFromSwap(t *testing.T) {
+	now := time.Now().UTC()
+	existing, runner := newTrackedTask("hash", now)
+	existing.CreatedAt = now
+
+	service := &Service{
+		conf:  Config{}.normalized(),
+		tasks: map[string]*Task{"hash": existing},
+	}
+
+	start := time.Now()
+	_, err := service.GetOrAdd(context.Background(), "hash", "2", 0)
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, ErrTaskBusy) {
+		t.Fatalf("GetOrAdd error=%v, want ErrTaskBusy", err)
+	}
+	if runner.disposed.Load() || existing.IsDisposed() {
+		t.Fatal("defended task was disposed anyway")
+	}
+	if service.tasks["hash"] != existing {
+		t.Fatal("defended task was replaced in the slot")
+	}
+	// Bounded: attempts and backoff, not an unbounded spin.
+	if elapsed > 5*time.Second {
+		t.Fatalf("GetOrAdd took %v, want it bounded by the retry budget", elapsed)
+	}
+}
+
+func TestGetOrAddStopsOnCancelledContext(t *testing.T) {
+	now := time.Now().UTC()
+	existing, _ := newTrackedTask("hash", now)
+	existing.CreatedAt = now
+
+	service := &Service{
+		conf:  Config{}.normalized(),
+		tasks: map[string]*Task{"hash": existing},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := service.GetOrAdd(ctx, "hash", "2", 0); !errors.Is(err, context.Canceled) {
+		t.Fatalf("GetOrAdd error=%v, want context.Canceled", err)
+	}
+}
+
+// The defence must be narrow: only a task that is both fresh and still being served.
+// Anything else — including one the viewer has actually been watching — stays evictable,
+// so switching episodes after watching for a while is not delayed.
+func TestSwapDefendedOnlyCoversFreshAndActiveTasks(t *testing.T) {
+	now := time.Now().UTC()
+
+	settled, _ := newTrackedTask("settled", now)
+	settled.CreatedAt = now.Add(-time.Hour)
+
+	idle, _ := newTrackedTask("idle", now.Add(-time.Hour))
+	idle.CreatedAt = now
+
+	fresh, _ := newTrackedTask("fresh", now)
+	fresh.CreatedAt = now
+
+	disposed, _ := newTrackedTask("disposed", now)
+	disposed.CreatedAt = now
+	disposed.Dispose()
+
+	for _, test := range []struct {
+		name string
+		task *Task
+		want bool
+	}{
+		{"nil", nil, false},
+		{"watched for a while", settled, false},
+		{"fresh but idle", idle, false},
+		{"disposed", disposed, false},
+		{"fresh and active", fresh, true},
+	} {
+		if got := swapDefended(test.task); got != test.want {
+			t.Fatalf("swapDefended(%s)=%v, want %v", test.name, got, test.want)
+		}
+	}
+}
+
+func TestTaskCallKeySeparatesFilesAndAudio(t *testing.T) {
+	keys := map[string]struct{}{}
+	for _, key := range []string{
+		taskCallKey("hash", "1", 0),
+		taskCallKey("hash", "2", 0),
+		taskCallKey("hash", "1", 1),
+		taskCallKey("other", "1", 0),
+	} {
+		if _, clash := keys[key]; clash {
+			t.Fatalf("taskCallKey collision on %q", key)
+		}
+		keys[key] = struct{}{}
+	}
+}
+
+// A missing cue index is usually the torrent not having buffered it yet, so it must not
+// be remembered for the full hour a real timeline is.
+func TestCueCacheExpiresMissingTimelineSooner(t *testing.T) {
+	service := &Service{cueCache: make(map[string]cueCacheEntry)}
+
+	service.setCachedCue("present", &CueTimeline{})
+	service.setCachedCue("absent", nil)
+
+	present := service.cueCache["present"].expiresAt
+	absent := service.cueCache["absent"].expiresAt
+	if !absent.Before(present) {
+		t.Fatalf("absent cue expires at %v, want sooner than %v", absent, present)
+	}
+
+	if cue, ok := service.getCachedCue("present"); !ok || cue == nil {
+		t.Fatal("cached cue timeline was not returned")
+	}
+	if cue, ok := service.getCachedCue("absent"); !ok || cue != nil {
+		t.Fatal("cached absence should be a hit carrying a nil timeline")
+	}
+
+	service.cleanupCueCache(time.Now().UTC().Add(2 * cueCacheTTL))
+	if len(service.cueCache) != 0 {
+		t.Fatalf("cue cache still holds %d entries after expiry sweep", len(service.cueCache))
+	}
+}
+
 func TestTaskLimitOneEvictsExistingTaskForProtectedNewTask(t *testing.T) {
 	now := time.Now().UTC()
 	oldTask, oldRunner := newTrackedTask("old", now.Add(-time.Minute))
@@ -168,7 +296,7 @@ func TestServiceDisposeRejectsFurtherWork(t *testing.T) {
 	if got := service.Get(task.ID); got != nil {
 		t.Fatal("disposed service returned a task")
 	}
-	if _, err := service.GetOrAdd("hash", "1", 0); !errors.Is(err, ErrServiceClosed) {
+	if _, err := service.GetOrAdd(context.Background(), "hash", "1", 0); !errors.Is(err, ErrServiceClosed) {
 		t.Fatalf("GetOrAdd error=%v, want ErrServiceClosed", err)
 	}
 	if _, err := service.Probe("hash", "1"); !errors.Is(err, ErrServiceClosed) {
