@@ -232,7 +232,10 @@ func TestWriteSegmentWritesPartialContentHeaders(t *testing.T) {
 	c.Request = httptest.NewRequest(http.MethodGet, "/segment", nil)
 	c.Request.Header.Set("Range", "bytes=2-5")
 
-	if err := writeSegment(c, Segment{Header: []byte("header"), Payloads: [][]byte{[]byte("payload")}}); err != nil {
+	lease := leaseSegment(Segment{Header: []byte("header"), Payloads: [][]byte{[]byte("payload")}})
+	defer lease.Release()
+
+	if err := writeSegmentBytes(c, lease.Bytes()); err != nil {
 		t.Fatal(err)
 	}
 	if response.Code != http.StatusPartialContent {
