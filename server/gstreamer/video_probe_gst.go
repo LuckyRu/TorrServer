@@ -358,6 +358,19 @@ func videoSegmentClipPadProbe(_ purego.CDecl, _ uintptr, info uintptr, userData 
 	return gstPadProbeOK
 }
 
+// The accessors below all reach a field through a pointer that arrived from GStreamer as
+// a uintptr. That is instrumented as pointer arithmetic with no recorded base, so
+// checkptr — which -race turns on — rejects any result that lands inside a Go allocation.
+// Real GStreamer objects are C memory and slip past the check; the Go structs the tests
+// stand in for them do not, and abort the whole test binary.
+//
+// Each therefore opts its own frame out. noinline goes with nocheckptr because the pragma
+// covers a frame, and these are small enough that they would otherwise be inlined into
+// callers that are still instrumented. The extra call costs nothing next to the buffer
+// handling around it.
+
+//go:nocheckptr
+//go:noinline
 func gstProbeInfoType(info uintptr) uint32 {
 	if info == 0 {
 		return 0
@@ -365,6 +378,8 @@ func gstProbeInfoType(info uintptr) uint32 {
 	return (*gstPadProbeInfoABI)(unsafe.Pointer(info)).probeType
 }
 
+//go:nocheckptr
+//go:noinline
 func gstProbeInfoData(info uintptr) uintptr {
 	if info == 0 {
 		return 0
@@ -375,6 +390,8 @@ func gstProbeInfoData(info uintptr) uintptr {
 	return (*gstPadProbeInfoUnixABI)(unsafe.Pointer(info)).data
 }
 
+//go:nocheckptr
+//go:noinline
 func gstEventType(event uintptr) uint32 {
 	if event == 0 {
 		return 0
@@ -382,6 +399,8 @@ func gstEventType(event uintptr) uint32 {
 	return (*gstEventABI)(unsafe.Pointer(event)).eventType
 }
 
+//go:nocheckptr
+//go:noinline
 func gstBufferPTS(buffer uintptr) (uint64, bool) {
 	if buffer == 0 {
 		return 0, false
@@ -390,6 +409,8 @@ func gstBufferPTS(buffer uintptr) (uint64, bool) {
 	return pts, pts != gstClockTimeNone
 }
 
+//go:nocheckptr
+//go:noinline
 func gstBufferClockTime(buffer uintptr) (uint64, bool) {
 	if buffer == 0 {
 		return 0, false
@@ -415,6 +436,8 @@ func gstSegmentClockTime(api *gstAPI, event uintptr) (uint64, bool) {
 	return start, start != gstClockTimeNone
 }
 
+//go:nocheckptr
+//go:noinline
 func gstTimeSegment(api *gstAPI, event uintptr) (start uint64, segmentTime uint64, ok bool) {
 	if api == nil || event == 0 || gstEventType(event) != gstEventSegment || api.gstEventParseSegment == nil {
 		return gstClockTimeNone, gstClockTimeNone, false

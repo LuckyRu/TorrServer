@@ -444,12 +444,27 @@ func (g *gstAPI) parseMessageError(msg uintptr) string {
 	return message
 }
 
+// gerrorABI mirrors GError: { GQuark domain; gint code; gchar *message; }. Declaring the
+// layout beats offsetting by hand, and matches the other ABI structs in this package.
+type gerrorABI struct {
+	domain  uint32
+	code    int32
+	message uintptr
+}
+
+// Reaching a field through a pointer that came from a uintptr is instrumented as pointer
+// arithmetic, and the compiler records no base for it, so checkptr — which -race turns on
+// — refuses any result landing inside a Go allocation. Real GErrors are GLib memory and
+// escape the check by accident; a test double built from a Go slice does not, and aborts
+// the whole test binary. Opt this one frame out rather than give up checkptr everywhere.
+//
+//go:nocheckptr
+//go:noinline
 func (g *gstAPI) takeGError(errPtr uintptr) string {
 	if errPtr == 0 {
 		return ""
 	}
-	messagePtr := *(*uintptr)(unsafe.Pointer(errPtr + 8))
-	message := cString(messagePtr)
+	message := cString((*gerrorABI)(unsafe.Pointer(errPtr)).message)
 	g.gErrorFree(errPtr)
 	return message
 }
@@ -475,14 +490,25 @@ func alignTo(value uintptr, alignment uintptr) uintptr {
 	return value + alignment - remainder
 }
 
+// A NUL-terminated C string has no length until it is walked, so this cannot be phrased
+// as a bounded conversion the way the ABI structs can. checkptr therefore has to be
+// switched off here: it would reject every step of the walk for lack of a recorded base
+// pointer, which is what used to abort the process under -race.
+//
+// noinline goes with it: the nocheckptr pragma applies to this function's own frame, and
+// inlining the walk into a caller puts the instrumentation back.
+//
+//go:nocheckptr
+//go:noinline
 func cString(ptr uintptr) string {
 	if ptr == 0 {
 		return ""
 	}
 
+	base := unsafe.Pointer(ptr)
 	var out []byte
 	for offset := uintptr(0); ; offset++ {
-		b := *(*byte)(unsafe.Pointer(ptr + offset))
+		b := *(*byte)(unsafe.Add(base, offset))
 		if b == 0 {
 			break
 		}
