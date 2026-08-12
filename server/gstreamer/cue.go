@@ -45,6 +45,12 @@ const (
 type CueSegment struct {
 	StartNS uint64 `json:"start_ns"`
 	EndNS   uint64 `json:"end_ns"`
+
+	// StartOffset is the absolute byte offset of the cluster this segment starts at, or
+	// 0 when the cue point did not carry one. Matroska cues pair every keyframe time
+	// with its cluster position, and keeping it lets the torrent layer be told where a
+	// segment actually begins instead of inferring it from a seek.
+	StartOffset int64 `json:"start_offset,omitempty"`
 }
 
 func (s CueSegment) DurationNS() uint64 { return s.EndNS - s.StartNS }
@@ -130,7 +136,7 @@ func readMatroskaCueTimeline(ctx context.Context, sourceURL string, contentLengt
 	if !ok {
 		return nil
 	}
-	return parseCueTimeline(cues, element, videoTrackNumber, timestampScaleNS, uint64(durationNS))
+	return parseCueTimeline(cues, element, videoTrackNumber, timestampScaleNS, uint64(durationNS), segmentDataOffset, contentLength)
 }
 
 func parseMatroskaPrefix(data []byte, offset int, positions map[uint64]uint64, timestampScaleNS *uint64, videoTrackNumber *uint64) {
@@ -229,18 +235,41 @@ func parseVideoTrackNumber(data []byte, tracks ebmlElement) uint64 {
 	return 0
 }
 
-func parseCueTimeline(data []byte, cues ebmlElement, videoTrack, timestampScaleNS, durationNS uint64) *CueTimeline {
-	times := make([]uint64, 0, 1024)
+// cuePoint pairs a keyframe time with the byte offset of the cluster holding it.
+type cuePoint struct {
+	timeNS uint64
+	offset int64
+}
+
+// clusterFileOffset turns a cue's Segment-relative cluster position into an absolute
+// file offset, returning 0 when it does not land inside the file.
+func clusterFileOffset(segmentDataOffset int64, cluster uint64, contentLength int64) int64 {
+	if segmentDataOffset < 0 || cluster > uint64(^uint64(0)>>1) {
+		return 0
+	}
+	offset := int64(cluster)
+	if offset > math.MaxInt64-segmentDataOffset {
+		return 0
+	}
+	offset += segmentDataOffset
+	if offset < 0 || (contentLength > 0 && offset >= contentLength) {
+		return 0
+	}
+	return offset
+}
+
+func parseCueTimeline(data []byte, cues ebmlElement, videoTrack, timestampScaleNS, durationNS uint64, segmentDataOffset int64, contentLength int64) *CueTimeline {
+	times := make([]cuePoint, 0, 1024)
 	for offset, end := cues.dataOffset, int(cues.endOffset()); offset < end; {
 		point, ok := readEBMLElement(data, offset)
 		if !ok || point.unknownSize || point.endOffset() > uint64(end) {
 			return nil
 		}
 		if point.id == cuePointID {
-			if cueTime, ok := readVideoCueTime(data, point, videoTrack); ok && cueTime <= ^uint64(0)/timestampScaleNS {
+			if cueTime, cluster, ok := readVideoCueTime(data, point, videoTrack); ok && cueTime <= ^uint64(0)/timestampScaleNS {
 				timeNS := cueTime * timestampScaleNS
 				if timeNS < durationNS {
-					times = append(times, timeNS)
+					times = append(times, cuePoint{timeNS: timeNS, offset: clusterFileOffset(segmentDataOffset, cluster, contentLength)})
 					if len(times) > maxMatroskaCuePoints {
 						return nil
 					}
@@ -252,18 +281,18 @@ func parseCueTimeline(data []byte, cues ebmlElement, videoTrack, timestampScaleN
 	if len(times) < 2 {
 		return nil
 	}
-	sort.Slice(times, func(i, j int) bool { return times[i] < times[j] })
+	sort.Slice(times, func(i, j int) bool { return times[i].timeNS < times[j].timeNS })
 	segments := make([]CueSegment, 0, len(times))
 	previous := times[0]
 	for _, current := range times[1:] {
-		if current <= previous {
+		if current.timeNS <= previous.timeNS {
 			continue
 		}
-		segments = append(segments, CueSegment{StartNS: previous, EndNS: current})
+		segments = append(segments, CueSegment{StartNS: previous.timeNS, EndNS: current.timeNS, StartOffset: previous.offset})
 		previous = current
 	}
-	if durationNS > previous {
-		segments = append(segments, CueSegment{StartNS: previous, EndNS: durationNS})
+	if durationNS > previous.timeNS {
+		segments = append(segments, CueSegment{StartNS: previous.timeNS, EndNS: durationNS, StartOffset: previous.offset})
 	}
 	if len(segments) == 0 {
 		return nil
@@ -277,40 +306,47 @@ func parseCueTimeline(data []byte, cues ebmlElement, videoTrack, timestampScaleN
 	return timeline
 }
 
-func readVideoCueTime(data []byte, point ebmlElement, videoTrack uint64) (uint64, bool) {
-	var cueTime uint64
+func readVideoCueTime(data []byte, point ebmlElement, videoTrack uint64) (uint64, uint64, bool) {
+	var cueTime, clusterPosition uint64
 	hasTime, hasPosition := false, false
 	for offset, end := point.dataOffset, int(point.endOffset()); offset < end; {
 		child, ok := readEBMLElement(data, offset)
 		if !ok || child.unknownSize || child.endOffset() > uint64(end) {
-			return 0, false
+			return 0, 0, false
 		}
 		if child.id == cueTimeID {
 			cueTime, hasTime = readEBMLUnsigned(data, child)
-		} else if child.id == cueTrackPositionsID && hasVideoCuePosition(data, child, videoTrack) {
-			hasPosition = true
+		} else if child.id == cueTrackPositionsID {
+			if position, ok := videoCueClusterPosition(data, child, videoTrack); ok {
+				clusterPosition, hasPosition = position, true
+			}
 		}
 		offset = int(child.endOffset())
 	}
-	return cueTime, hasTime && hasPosition
+	return cueTime, clusterPosition, hasTime && hasPosition
 }
 
-func hasVideoCuePosition(data []byte, positions ebmlElement, videoTrack uint64) bool {
-	var track uint64
+// videoCueClusterPosition returns the cluster position of a video cue, relative to the
+// start of the Segment element's data.
+func videoCueClusterPosition(data []byte, positions ebmlElement, videoTrack uint64) (uint64, bool) {
+	var track, cluster uint64
 	hasCluster := false
 	for offset, end := positions.dataOffset, int(positions.endOffset()); offset < end; {
 		child, ok := readEBMLElement(data, offset)
 		if !ok || child.unknownSize || child.endOffset() > uint64(end) {
-			return false
+			return 0, false
 		}
 		if child.id == cueTrackID {
 			track, _ = readEBMLUnsigned(data, child)
 		} else if child.id == cueClusterPositionID {
-			_, hasCluster = readEBMLUnsigned(data, child)
+			cluster, hasCluster = readEBMLUnsigned(data, child)
 		}
 		offset = int(child.endOffset())
 	}
-	return track == videoTrack && hasCluster
+	if track != videoTrack || !hasCluster {
+		return 0, false
+	}
+	return cluster, true
 }
 
 func readMatroskaElement(ctx context.Context, sourceURL string, segmentOffset int64, relative uint64, expectedID uint64, maxLength int, contentLength int64) []byte {
