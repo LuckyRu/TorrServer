@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -34,6 +35,10 @@ type Task struct {
 	// while", which is how the service tells a swap fight from an episode switch.
 	CreatedAt time.Time
 
+	// AcquireTorrent keeps pipeline startup off the torrent while probing or cue reading
+	// is using it; nil in tests, where there is no torrent to contend for.
+	AcquireTorrent func() func()
+
 	LastSentSegment int
 
 	initMu  sync.RWMutex
@@ -49,6 +54,11 @@ type Task struct {
 
 	subtitleMu     sync.RWMutex
 	subtitleStores map[int]*subtitleStore
+
+	failureMu   sync.Mutex
+	failedKey   string
+	failedAt    time.Time
+	failedError error
 
 	disposed atomic.Bool
 }
@@ -127,6 +137,16 @@ func (t *Task) tryLock() bool {
 
 func (t *Task) unlock() {
 	<-t.gateChan()
+}
+
+func (t *Task) acquireTorrent() func() {
+	if t == nil || t.AcquireTorrent == nil {
+		return func() {}
+	}
+	if release := t.AcquireTorrent(); release != nil {
+		return release
+	}
+	return func() {}
 }
 
 func (t *Task) UpdateLastActive() {
@@ -291,12 +311,21 @@ func (t *Task) WithSegment(ctx context.Context, index int, audio int, consume fu
 // The caller writes it out after the lock is gone, so a player that stops reading its
 // response can no longer stall every other request on this task.
 func (t *Task) LeaseSegment(ctx context.Context, index int, audio int) (*SegmentLease, error) {
+	if err := t.recentSegmentFailure(index, audio); err != nil {
+		return nil, err
+	}
 	if err := t.lock(ctx); err != nil {
 		return nil, err
 	}
 	defer t.unlock()
 
+	// Re-check under the gate: the request ahead of us may have just failed this segment.
+	if err := t.recentSegmentFailure(index, audio); err != nil {
+		return nil, err
+	}
+
 	seg, err := t.segmentLocked(ctx, index, audio)
+	t.noteSegmentOutcome(index, audio, err)
 	if err != nil {
 		return nil, err
 	}
@@ -415,6 +444,48 @@ func (t *Task) validateSegmentIndex(index int) error {
 }
 
 const maxSegmentCatchupSeconds = 60
+
+// A failing segment fails the same way if asked again immediately, and each attempt costs
+// a seek and a fresh reader on the torrent. Players retry hard — four requests inside two
+// seconds shows up in the logs — so replay the last error for a moment instead of tearing
+// the pipeline down again for each one.
+const segmentFailureDebounce = 1500 * time.Millisecond
+
+func segmentFailureKey(index int, audio int) string {
+	return strconv.Itoa(index) + ":" + strconv.Itoa(audio)
+}
+
+func (t *Task) recentSegmentFailure(index int, audio int) error {
+	t.failureMu.Lock()
+	defer t.failureMu.Unlock()
+
+	if t.failedError == nil || t.failedKey != segmentFailureKey(index, audio) {
+		return nil
+	}
+	if time.Since(t.failedAt) >= segmentFailureDebounce {
+		t.failedError = nil
+		return nil
+	}
+	return t.failedError
+}
+
+func (t *Task) noteSegmentOutcome(index int, audio int, err error) {
+	// Cancellation says nothing about the segment: the next request may well succeed.
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return
+	}
+
+	t.failureMu.Lock()
+	defer t.failureMu.Unlock()
+
+	if err == nil {
+		t.failedError = nil
+		return
+	}
+	t.failedKey = segmentFailureKey(index, audio)
+	t.failedAt = time.Now()
+	t.failedError = err
+}
 
 func (t *Task) Frozen() {
 	t.lockBlocking()

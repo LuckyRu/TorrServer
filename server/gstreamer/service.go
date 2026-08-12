@@ -52,6 +52,9 @@ type Service struct {
 	cueCache map[string]cueCacheEntry
 	cueCalls singleflight.Group
 
+	gateMu sync.Mutex
+	gates  map[string]chan struct{}
+
 	cleanupRunning atomic.Bool
 	disposed       atomic.Bool
 	stopCleanup    chan struct{}
@@ -69,6 +72,10 @@ const (
 
 	cueCacheTTL         = probeCacheTTL
 	cueNegativeCacheTTL = time.Minute
+
+	// How long an operation waits for the torrent gate before going ahead regardless.
+	probeGateWait    = 20 * time.Second
+	pipelineGateWait = 15 * time.Second
 )
 
 type probeCacheEntry struct {
@@ -190,6 +197,7 @@ func (s *Service) getOrAdd(ctx context.Context, hash string, fileID string, audi
 	if err != nil {
 		return nil, err
 	}
+	task.AcquireTorrent = func() func() { return s.acquireTorrentWithin(id, pipelineGateWait) }
 
 	var replaced *Task
 	var evicted []*Task
@@ -247,6 +255,67 @@ func swapDefended(task *Task) bool {
 
 func taskCallKey(hash string, fileID string, audio int) string {
 	return hash + "\x00" + fileID + "\x00" + strconv.Itoa(audio)
+}
+
+// acquireTorrent serialises the operations that each open their own TorrServer reader:
+// probing, reading the cue index, starting a pipeline.
+//
+// TorrServer splits a torrent's connection budget across every open reader
+// (ConnectionsLimit / len(readers) in the cache prioritiser) and gives each reader its own
+// "fetch this piece now" claim at its own offset. Running these at the same time therefore
+// starves whichever one the viewer is actually waiting for, which is how a pipeline ends up
+// unable to preroll while the swarm is plainly fast.
+//
+// The gate is per torrent, not per file, because the budget is shared per torrent.
+func (s *Service) acquireTorrent(ctx context.Context, hash string) (func(), error) {
+	if hash == "" {
+		return func() {}, nil
+	}
+
+	gate := s.torrentGate(hash)
+	select {
+	case gate <- struct{}{}:
+		return func() { <-gate }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// acquireTorrentWithin is for callers without a request context. It gives up after the
+// timeout and lets the caller proceed anyway: waiting forever behind another torrent
+// operation would be a worse failure than the contention it is trying to avoid.
+func (s *Service) acquireTorrentWithin(hash string, timeout time.Duration) func() {
+	if hash == "" {
+		return func() {}
+	}
+
+	gate := s.torrentGate(hash)
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case gate <- struct{}{}:
+		return func() { <-gate }
+	case <-timer.C:
+		return func() {}
+	}
+}
+
+// Gates are kept for the lifetime of the service: one channel per torrent ever played is
+// negligible, and reclaiming them safely would need reference counting for no real gain.
+func (s *Service) torrentGate(hash string) chan struct{} {
+	s.gateMu.Lock()
+	defer s.gateMu.Unlock()
+
+	if s.gates == nil {
+		s.gates = make(map[string]chan struct{})
+	}
+	gate := s.gates[hash]
+	if gate == nil {
+		gate = make(chan struct{}, 1)
+		s.gates[hash] = gate
+	}
+	return gate
 }
 
 func sleepContext(ctx context.Context, delay time.Duration) error {
@@ -358,7 +427,11 @@ func (s *Service) Probe(hash string, fileID string) (ProbeInfo, error) {
 			return cached, err
 		}
 		conf := s.currentConfig()
+		// gst-discoverer opens its own TorrServer reader; keep it off the torrent while
+		// another operation is already reading it. See acquireTorrent.
+		release := s.acquireTorrentWithin(hash, probeGateWait)
 		result, err := probeSource(sourceURL(conf, hash, fileID), conf)
+		release()
 		if err != nil {
 			return ProbeInfo{}, err
 		}
@@ -404,7 +477,12 @@ func (s *Service) cueTimeline(ctx context.Context, conf Config, hash string, fil
 		if cue, ok := s.getCachedCue(key); ok {
 			return cue, nil
 		}
+		release, err := s.acquireTorrent(ctx, hash)
+		if err != nil {
+			return nil, err
+		}
 		cue := readMatroskaCueTimeline(ctx, sourceURL, probe.FileSize, probe.DurationNS)
+		release()
 		if cue == nil && ctx.Err() != nil {
 			// Cancelled, not absent: caching this would deny the next caller a cue
 			// timeline it could have had.
