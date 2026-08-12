@@ -29,6 +29,31 @@
   </a>
 </p>
 
+## TorrentMod downstream fork
+
+This repository is the `LuckyRu/TorrServer` downstream fork used by the TorrentServer Manager and its Torrent Mod plugin for Lampa. The default branch is `torrserver-manager`.
+
+### Why this fork exists
+
+The fork carries a small, deliberately maintained set of downstream changes that are required by this product:
+
+- reliable GStreamer HLS playback for torrent files, including bounded task contention and segment access;
+- container-aware media handling and probing needed to expose video, audio, and subtitle tracks to the player;
+- playback behavior and diagnostics that match the Torrent Mod preflight and recovery flow;
+- a pinned, reproducible source tree that can be built as part of the Manager release.
+
+The goal is to keep the upstream TorrServer project intact while making the streaming path predictable for the Lampa/Torrent Mod use case. The fork is not an independent replacement for upstream and does not automatically track every upstream commit.
+
+### Relationship with upstream
+
+Upstream TorrServer releases remain the base for downstream work. Release tags use the following format:
+
+```text
+MatriX.<upstream-version>-TorrentMod.<downstream-version>
+```
+
+For example, `MatriX.142.2-TorrentMod.1.0` identifies the upstream base and the downstream patch series used by the product. Upstream updates are reviewed and rebased manually, then rebuilt and tested before a new downstream tag is published.
+
 ## Introduction
 
 TorrServer is a program that allows users to view torrents online without the need for preliminary file downloading.
