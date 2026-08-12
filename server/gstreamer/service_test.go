@@ -5,6 +5,7 @@ package gstreamer
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -189,7 +190,7 @@ func TestCachedProbeIsRevalidatedAfterConfigChange(t *testing.T) {
 	})
 
 	service.updateConfig(Config{})
-	if _, err := service.Probe("hash", "1"); !errors.Is(err, ErrUnsupportedContainer) {
-		t.Fatalf("Probe error=%v, want ErrUnsupportedContainer", err)
+	if _, err := service.Probe("hash", "1"); err == nil || !strings.Contains(err.Error(), "AVI requires TranscodeAVI") {
+		t.Fatalf("Probe error=%v, want AVI requires TranscodeAVI", err)
 	}
 }

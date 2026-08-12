@@ -83,6 +83,23 @@ Properties:
 	}
 }
 
+func TestProbeParsesISOBaseMediaContainer(t *testing.T) {
+	probe := probeFromDiscoverer(`
+Properties:
+  Duration: 0:01:00.000000000
+  container #0: ISO MP4/M4A
+    video #1: H.264 (High Profile)
+    audio #2: MPEG-4 AAC
+`)
+
+	if !probe.IsISOBaseMediaContainer() {
+		t.Fatal("ISO Base Media container was not accepted")
+	}
+	if got := probe.DemuxerName(); got != "qtdemux" {
+		t.Fatalf("DemuxerName() = %q, want qtdemux", got)
+	}
+}
+
 func TestProbeParsesAACAudioCodec(t *testing.T) {
 	probe := probeFromDiscoverer(`
 Properties:
@@ -131,15 +148,53 @@ Properties:
 	}
 }
 
-func TestValidateProbeRejectsNonMatroska(t *testing.T) {
+func TestValidateProbeAcceptsISOBaseMedia(t *testing.T) {
 	err := validateProbe(ProbeInfo{
-		Container: "Quicktime",
+		Container: "ISO MP4/M4A",
 		Tracks: []TrackInfo{
 			{Type: "video", CapsName: "video/x-h264"},
 		},
 	}, Config{})
-	if err == nil {
-		t.Fatal("non-Matroska source was accepted")
+	if err != nil {
+		t.Fatalf("ISO Base Media source was rejected: %v", err)
+	}
+}
+
+func TestProbeSelectsSequentialPadDemuxers(t *testing.T) {
+	tests := []struct {
+		name    string
+		probe   ProbeInfo
+		demuxer string
+	}{
+		{
+			name:    "ASF",
+			probe:   ProbeInfo{Container: "ASF", ContainerCapsName: "video/x-ms-asf"},
+			demuxer: "asfdemux",
+		},
+		{
+			name:    "FLV",
+			probe:   ProbeInfo{Container: "Flash Video", ContainerCapsName: "video/x-flv"},
+			demuxer: "flvdemux",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if actual := tt.probe.DemuxerName(); actual != tt.demuxer {
+				t.Fatalf("DemuxerName() = %q, want %q", actual, tt.demuxer)
+			}
+		})
+	}
+}
+
+func TestValidateProbeAcceptsUnknownVideoForTranscode(t *testing.T) {
+	err := validateProbe(ProbeInfo{
+		Container: "Matroska",
+		Tracks: []TrackInfo{
+			{Type: "video", CapsName: "video/x-theora"},
+		},
+	}, Config{})
+	if err != nil {
+		t.Fatalf("video suitable for decode/transcode was rejected: %v", err)
 	}
 }
 
@@ -157,15 +212,12 @@ func TestValidateProbeAcceptsAVIOnlyWithTranscode(t *testing.T) {
 	}
 }
 
-func TestValidateProbeAcceptsVP8OnlyWithTranscode(t *testing.T) {
+func TestValidateProbeAcceptsVP8ForTranscode(t *testing.T) {
 	probe := ProbeInfo{
 		Container: "WebM",
 		Tracks:    []TrackInfo{{Type: "video", CapsName: "video/x-vp8"}},
 	}
-	if err := validateProbe(probe, Config{}); err == nil {
-		t.Fatal("VP8 was accepted without TranscodeVP8")
-	}
-	if err := validateProbe(probe, Config{TranscodeVP8: true}); err != nil {
-		t.Fatalf("VP8 with TranscodeVP8 was rejected: %v", err)
+	if err := validateProbe(probe, Config{}); err != nil {
+		t.Fatalf("VP8 source suitable for decode/transcode was rejected: %v", err)
 	}
 }

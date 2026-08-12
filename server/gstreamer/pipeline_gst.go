@@ -451,11 +451,9 @@ func (r *gstRunner) createPipelineArgs() string {
 	if gstVersion.atLeast(1, 26) {
 		sb.WriteString("retry-backoff-factor=0.5 retry-backoff-max=10 ")
 	}
-	if probe.IsAVIContainer() {
-		sb.WriteString(" ! avidemux name=d ")
-	} else {
-		sb.WriteString(" ! matroskademux name=d ")
-	}
+	sb.WriteString(" ! ")
+	sb.WriteString(probe.DemuxerName())
+	sb.WriteString(" name=d ")
 	sb.WriteString("multiqueue name=mq use-buffering=false max-size-buffers=5 max-size-bytes=0 max-size-time=0 ")
 
 	sb.WriteString("d.video_0 ! mq.sink_0 ")
@@ -700,10 +698,8 @@ func videoIsTranscoded(conf Config, probe ProbeInfo) bool {
 		return conf.TranscodeAV1
 	case probe.IsVP9():
 		return conf.TranscodeVP9
-	case probe.IsVP8():
-		return conf.TranscodeVP8
 	default:
-		return false
+		return probe.VideoCapsName() != ""
 	}
 }
 
