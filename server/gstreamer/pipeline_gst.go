@@ -1296,6 +1296,12 @@ func (r *gstRunner) freezeAtPosition(seconds float64) {
 
 func (r *gstRunner) startPipeline(seconds float64) (float64, error) {
 	r.ensureTransientState()
+
+	// Prerolling opens a reader on the torrent and has a hard state-change budget, so it
+	// must not race probing or cue reading for the same torrent's connections.
+	releaseTorrent := r.task.acquireTorrent()
+	defer releaseTorrent()
+
 	gstTaskDebugf(r.task, "pipeline start requested=%.3fs audio=%d", seconds, r.audioIndex)
 	pipeline, err := gstRuntime.parseLaunch(r.createPipelineArgs())
 	if err != nil {
