@@ -153,6 +153,43 @@ func (p ProbeInfo) IsAVIContainer() bool {
 	return strings.Contains(container, "video/x-msvideo") || strings.Contains(container, "avi")
 }
 
+func (p ProbeInfo) IsISOBaseMediaContainer() bool {
+	container := strings.ToLower(strings.TrimSpace(p.Container + " " + p.ContainerCapsName))
+	return strings.Contains(container, "video/quicktime") ||
+		strings.Contains(container, "video/mp4") ||
+		strings.Contains(container, "audio/x-m4a") ||
+		strings.Contains(container, "quicktime") ||
+		strings.Contains(container, "iso mp4") ||
+		strings.Contains(container, "mpeg-4")
+}
+
+func (p ProbeInfo) IsASFContainer() bool {
+	container := strings.ToLower(strings.TrimSpace(p.Container + " " + p.ContainerCapsName))
+	return strings.Contains(container, "video/x-ms-asf") || strings.Contains(container, "asf")
+}
+
+func (p ProbeInfo) IsFLVContainer() bool {
+	container := strings.ToLower(strings.TrimSpace(p.Container + " " + p.ContainerCapsName))
+	return strings.Contains(container, "video/x-flv") || strings.Contains(container, "flash video") || strings.Contains(container, "flv")
+}
+
+func (p ProbeInfo) DemuxerName() string {
+	switch {
+	case p.IsMatroskaContainer():
+		return "matroskademux"
+	case p.IsISOBaseMediaContainer():
+		return "qtdemux"
+	case p.IsAVIContainer():
+		return "avidemux"
+	case p.IsASFContainer():
+		return "asfdemux"
+	case p.IsFLVContainer():
+		return "flvdemux"
+	default:
+		return ""
+	}
+}
+
 func (p ProbeInfo) IsH264() bool { return p.VideoCapsName() == "video/x-h264" }
 func (p ProbeInfo) IsH265() bool { return p.VideoCapsName() == "video/x-h265" }
 func (p ProbeInfo) IsAV1() bool  { return p.VideoCapsName() == "video/x-av1" }

@@ -21,8 +21,7 @@ import (
 
 var (
 	ErrBadSource               = errors.New("bad gstreamer source")
-	ErrUnsupportedContainer    = errors.New("unsupported container; only Matroska/WebM is supported")
-	ErrUnsupportedVideo        = errors.New("unsupported video codec")
+	ErrUnsupportedContainer    = errors.New("unsupported container")
 	ErrUnsupportedHDRTransfer  = errors.New("HDR tone mapping requires a PQ or HLG base layer")
 	ErrProbeUnavailable        = errors.New("gst-discoverer returned no stream info")
 	ErrPipelineUnavailable     = errors.New("gstreamer runtime is unavailable")
@@ -328,18 +327,15 @@ func validateProbe(probe ProbeInfo, conf Config) error {
 	if conf.HDRToSDR && probe.Video().IsHDRVideo() && probe.Video().VideoTransfer != "pq" && probe.Video().VideoTransfer != "hlg" {
 		return ErrUnsupportedHDRTransfer
 	}
-	transcodeAVI := probe.IsAVIContainer() && conf.TranscodeAVI
-	if !probe.IsMatroskaContainer() && !transcodeAVI {
+	if probe.DemuxerName() == "" {
 		name := strings.TrimSpace(probe.Container)
 		if name == "" {
 			name = "<unknown>"
 		}
 		return fmt.Errorf("%w: %s", ErrUnsupportedContainer, name)
 	}
-	supported := probe.IsH264() || probe.IsH265() || probe.IsAV1() || probe.IsVP9() ||
-		(probe.IsVP8() && conf.TranscodeVP8) || transcodeAVI
-	if !supported {
-		return ErrUnsupportedVideo
+	if probe.IsAVIContainer() && !conf.TranscodeAVI {
+		return errors.New("AVI requires TranscodeAVI")
 	}
 	return nil
 }
