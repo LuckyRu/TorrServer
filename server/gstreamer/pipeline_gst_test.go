@@ -46,6 +46,36 @@ func TestCreatePipelineArgsUsesSingleBufferAppSink(t *testing.T) {
 	}
 }
 
+func TestCreatePipelineArgsUsesQuickTimeDemuxer(t *testing.T) {
+	runner := newVersionedVideoPipelineRunner(1.28)
+	runner.task.Probe.Container = "ISO MP4/M4A"
+
+	args := runner.createPipelineArgs()
+	if !strings.Contains(args, " ! qtdemux name=d ") {
+		t.Fatalf("createPipelineArgs() =\n%s\nwant qtdemux", args)
+	}
+}
+
+func TestCreatePipelineArgsUsesASFDemuxer(t *testing.T) {
+	runner := newVersionedVideoPipelineRunner(1.28)
+	runner.task.Probe.Container = "ASF"
+	runner.task.Probe.ContainerCapsName = "video/x-ms-asf"
+
+	if args := runner.createPipelineArgs(); !strings.Contains(args, "asfdemux name=d") {
+		t.Fatalf("pipeline does not use asfdemux: %s", args)
+	}
+}
+
+func TestUnknownVideoCodecUsesTranscodePipeline(t *testing.T) {
+	runner := newVersionedVideoPipelineRunner(1.28)
+	runner.task.Probe.Tracks[0].CapsName = "video/x-theora"
+
+	args := runner.createPipelineArgs()
+	if !strings.Contains(args, "mq.src_0 ! decodebin !") {
+		t.Fatalf("createPipelineArgs() =\n%s\nwant decode/transcode branch", args)
+	}
+}
+
 func TestCreatePipelineArgsUsesMultiqueueWithoutBranchQueueLimits(t *testing.T) {
 	clearGStreamerRuntimeVersion(t)
 
