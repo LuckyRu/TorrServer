@@ -1521,6 +1521,68 @@ func TestTaskLeaseSegmentSkipsSeekForCancelledRequest(t *testing.T) {
 	}
 }
 
+// A player that retries a failing segment must not cost a pipeline teardown per attempt.
+func TestTaskLeaseSegmentDebouncesRepeatedFailure(t *testing.T) {
+	sentinel := errors.New("segment exploded")
+	var attempts atomic.Int64
+	task := &Task{
+		LastSentSegment: -1,
+		Config:          Config{SegmentSeconds: 6}.normalized(),
+		runner: &fakePipelineRunner{
+			getSegment: func(context.Context, int, int) (Segment, error) {
+				attempts.Add(1)
+				return Segment{}, sentinel
+			},
+		},
+	}
+
+	for range 4 {
+		if _, err := task.LeaseSegment(context.Background(), 0, 0); !errors.Is(err, sentinel) {
+			t.Fatalf("error=%v, want sentinel", err)
+		}
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("runner was asked %d times, want 1 — the rest should replay the last error", got)
+	}
+
+	// A different segment is not suppressed.
+	if _, err := task.LeaseSegment(context.Background(), 1, 0); !errors.Is(err, sentinel) {
+		t.Fatalf("error=%v, want sentinel", err)
+	}
+	if got := attempts.Load(); got != 2 {
+		t.Fatalf("attempts=%d, want the second index to reach the runner", got)
+	}
+}
+
+// Cancellation says nothing about the segment, so it must not be remembered as a failure.
+func TestTaskLeaseSegmentDoesNotDebounceCancellation(t *testing.T) {
+	var attempts atomic.Int64
+	task := &Task{
+		LastSentSegment: -1,
+		Config:          Config{SegmentSeconds: 6}.normalized(),
+		runner: &fakePipelineRunner{
+			getSegment: func(ctx context.Context, _ int, _ int) (Segment, error) {
+				attempts.Add(1)
+				if err := ctx.Err(); err != nil {
+					return Segment{}, err
+				}
+				return Segment{Header: []byte("segment")}, nil
+			},
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _ = task.LeaseSegment(ctx, 0, 0)
+
+	if _, err := task.LeaseSegment(context.Background(), 0, 0); err != nil {
+		t.Fatalf("error=%v, want the retry to be attempted", err)
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("attempts=%d, want the cancelled request not to poison the next one", got)
+	}
+}
+
 // Everything a task can be asked to do, at once, the way a player plus the cleanup
 // loop plus the bus watcher would. Errors are expected once Dispose lands; what this
 // asserts is that the gate keeps LastSentSegment and the runner handle consistent, that
