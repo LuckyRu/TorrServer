@@ -137,6 +137,57 @@ func TestSwapDefendedOnlyCoversFreshAndActiveTasks(t *testing.T) {
 	}
 }
 
+// Probing, cue reading and pipeline startup each open their own TorrServer reader, and the
+// torrent's connection budget is split across open readers — so they have to take turns.
+func TestAcquireTorrentSerialisesPerHash(t *testing.T) {
+	service := &Service{conf: Config{}.normalized()}
+
+	release, err := service.acquireTorrent(context.Background(), "hash")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A different torrent is unaffected.
+	otherRelease, err := service.acquireTorrent(context.Background(), "other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherRelease()
+
+	// The same torrent waits, and gives up with the caller's context.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := service.acquireTorrent(ctx, "hash"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("second acquire error=%v, want context.Canceled", err)
+	}
+
+	// Callers without a context proceed anyway rather than stall forever.
+	start := time.Now()
+	fallback := service.acquireTorrentWithin("hash", 30*time.Millisecond)
+	if elapsed := time.Since(start); elapsed < 25*time.Millisecond {
+		t.Fatalf("acquireTorrentWithin returned after %v, want it to wait for the timeout", elapsed)
+	}
+	fallback()
+
+	release()
+	again, err := service.acquireTorrent(context.Background(), "hash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	again()
+}
+
+func TestAcquireTorrentIgnoresEmptyHash(t *testing.T) {
+	service := &Service{conf: Config{}.normalized()}
+	for range 3 {
+		release, err := service.acquireTorrent(context.Background(), "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		release()
+	}
+}
+
 func TestTaskCallKeySeparatesFilesAndAudio(t *testing.T) {
 	keys := map[string]struct{}{}
 	for _, key := range []string{
