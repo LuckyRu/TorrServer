@@ -23,7 +23,9 @@ type Cache struct {
 	storage.TorrentImpl
 	storage *Storage
 
-	capacity int64
+	// capacity is the configured size for a single viewer; effectiveCapacity scales it.
+	// Atomic because Init and AdjustRA write it while the eviction sweep reads it.
+	capacity atomic.Int64
 	filled   int64
 	hash     metainfo.Hash
 
@@ -47,20 +49,70 @@ type Cache struct {
 
 func NewCache(capacity int64, storage *Storage) *Cache {
 	ret := &Cache{
-		capacity: capacity,
-		filled:   0,
-		pieces:   make(map[int]*Piece),
-		storage:  storage,
-		readers:  make(map[*Reader]struct{}),
+		filled:  0,
+		pieces:  make(map[int]*Piece),
+		storage: storage,
+		readers: make(map[*Reader]struct{}),
 	}
+	ret.capacity.Store(capacity)
 
 	return ret
 }
 
+// maxCapacityReaders and maxCapacityBytes cap how far the cache grows with viewers.
+//
+// A reader's window is capacity/readers wide (see Reader.getOffsetRange), so without
+// scaling every new viewer shrinks everybody's buffer: at a 4K bitrate a 64 MB cache split
+// five ways is a couple of seconds of video each. Scaling with the reader count gives each
+// viewer back the window a single viewer would have had.
+//
+// The ceilings are what keeps that bounded, and they matter because the cost is paid per
+// torrent: several torrents playing at once multiply it.
+const (
+	maxCapacityReaders = 4
+	maxCapacityBytes   = 512 << 20
+)
+
+// minConnectionsPerReader is the floor under a viewer's share of the torrent's connection
+// budget.
+//
+// An even split starves everybody once there are a few viewers: at the default limit of 25
+// a fifth viewer leaves each of them five concurrent blocks, which is not enough to hold a
+// stream. The floor means the total may exceed ConnectionsLimit — that is deliberate, and
+// EstablishedConnsPerTorrent should be raised to match in a house with several viewers.
+const minConnectionsPerReader = 8
+
+func connectionsPerReader(activeReaders int) int {
+	if activeReaders < 1 {
+		activeReaders = 1
+	}
+	return max(minConnectionsPerReader, settings.BTsets.ConnectionsLimit/activeReaders)
+}
+
+// effectiveCapacity is the cache size for the number of viewers there are right now.
+func (c *Cache) effectiveCapacity() int64 {
+	base := c.capacity.Load()
+	if base <= 0 {
+		return base
+	}
+
+	readers := int64(c.GetUseReaders())
+	if readers < 1 {
+		readers = 1
+	}
+	if readers > maxCapacityReaders {
+		readers = maxCapacityReaders
+	}
+
+	// Never below the configured size: someone who asked for a cache larger than the
+	// ceiling meant it.
+	return max(base, min(base*readers, maxCapacityBytes))
+}
+
 func (c *Cache) Init(info *metainfo.Info, hash metainfo.Hash) {
 	log.TLogln("Create cache for:", info.Name, hash.HexString())
-	if c.capacity == 0 {
-		c.capacity = info.PieceLength * 4
+	if c.capacity.Load() == 0 {
+		c.capacity.Store(info.PieceLength * 4)
 	}
 
 	c.pieceLength = info.PieceLength
@@ -152,7 +204,7 @@ func (c *Cache) AdjustRA(readahead int64) {
 		return
 	}
 	if settings.BTsets.CacheSize == 0 {
-		c.capacity = readahead * 3
+		c.capacity.Store(readahead * 3)
 	}
 	for _, r := range c.readersSnapshot() {
 		r.SetReadahead(readahead)
@@ -191,7 +243,7 @@ func (c *Cache) GetState() *state.CacheState {
 	}
 
 	c.filled = fill
-	cState.Capacity = c.capacity
+	cState.Capacity = c.effectiveCapacity()
 	cState.PiecesLength = c.pieceLength
 	cState.PiecesCount = c.pieceCount
 	cState.Hash = c.hash.HexString()
@@ -216,8 +268,9 @@ func (c *Cache) cleanPieces() {
 	defer func() { c.isRemove.Store(false) }()
 
 	remPieces := c.getRemPieces()
-	if c.filled > c.capacity {
-		rems := (c.filled-c.capacity)/c.pieceLength + 1
+	capacity := c.effectiveCapacity()
+	if c.filled > capacity {
+		rems := (c.filled-capacity)/c.pieceLength + 1
 		for _, p := range remPieces {
 			c.removePiece(p)
 			rems--
@@ -282,6 +335,17 @@ func (c *Cache) setLoadPriority(ranges []Range) {
 	if len(readers) == 0 || pieces == nil {
 		return
 	}
+	// Split the budget between viewers, not between readers: a reader that has gone idle
+	// still counted in the divisor and quietly took bandwidth away from the one somebody
+	// is actually watching.
+	active := 0
+	for _, r := range readers {
+		if r.isUse {
+			active++
+		}
+	}
+	count := connectionsPerReader(active) // max concurrent loading blocks
+
 	for _, r := range readers {
 		if !r.isUse {
 			continue
@@ -292,7 +356,6 @@ func (c *Cache) setLoadPriority(ranges []Range) {
 		readerPos := r.getReaderPiece()
 		readerRAHPos := r.getReaderRAHPiece()
 		end := r.getPiecesRange().End
-		count := settings.BTsets.ConnectionsLimit / len(readers) // max concurrent loading blocks
 		limit := 0
 		for i := readerPos; i < end && limit < count; i++ {
 			if !pieces[i].Complete {
@@ -436,5 +499,5 @@ func (c *Cache) GetCapacity() int64 {
 	if c == nil {
 		return 0
 	}
-	return c.capacity
+	return c.effectiveCapacity()
 }
