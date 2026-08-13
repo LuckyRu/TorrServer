@@ -287,15 +287,37 @@ func WriteStatus(w io.Writer) {
 	bts.client.WriteStatus(w)
 }
 
-func Preload(torr *Torrent, index int) {
+// preloadMaxBytes bounds how long a viewer stares at a black screen before playback may
+// begin.
+//
+// PreloadCache is a percentage of the cache, so the preload grows whenever the cache does
+// - and it is fetched from the head of the file, which is not where a viewer resuming
+// mid-episode needs bytes. Raising the cache to 256 MB turned a 16 second wait into 94, and
+// the pipeline could not preroll for the whole of it because the preload was using the
+// torrent. Startup latency is what this number governs, so it is capped in bytes rather
+// than left proportional to something unrelated.
+const preloadMaxBytes = 64 << 20
+
+func preloadSize() int64 {
 	cache := float32(sets.BTsets.CacheSize)
 	preload := float32(sets.BTsets.PreloadCache)
 	size := int64((cache / 100.0) * preload)
 	if size <= 0 {
-		return
+		return 0
 	}
 	if size > sets.BTsets.CacheSize {
 		size = sets.BTsets.CacheSize
+	}
+	if size > preloadMaxBytes {
+		size = preloadMaxBytes
+	}
+	return size
+}
+
+func Preload(torr *Torrent, index int) {
+	size := preloadSize()
+	if size <= 0 {
+		return
 	}
 	torr.Preload(index, size)
 }

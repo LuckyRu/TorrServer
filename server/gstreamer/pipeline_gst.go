@@ -34,6 +34,17 @@ const (
 	gstPollInterval      = 100 * time.Millisecond
 )
 
+// pipelinePrerollTimeout is how long reaching PAUSED or PLAYING may take.
+//
+// That transition is a preroll: GStreamer pulls real media through souphttpsrc, so it waits
+// on the torrent fetching pieces from peers. pipelineStateTimeout is a local-file budget,
+// and against a torrent that has just been added - or one seeking to a position nothing has
+// downloaded yet - ASYNC means "still working", not "failed".
+//
+// Matches pipelineReadTimeout: both are the same wait on the same swarm. A var rather than
+// a const so tests can shorten it, the same way they replace gstRuntime.
+var pipelinePrerollTimeout = 45 * time.Second
+
 var aacEncoderRates = [...]int{7350, 8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, 64000, 88200, 96000}
 
 type gstRunner struct {
@@ -1415,6 +1426,31 @@ func (r *gstRunner) startPipeline(seconds float64) (float64, error) {
 	return actualStartSeconds, nil
 }
 
+// awaitPreroll polls for the state change instead of giving up on the first ASYNC.
+//
+// Polling rather than one long blocking wait so that a pipeline disposed underneath us -
+// the viewer navigated away - stops waiting on a swarm nobody is listening to, and so that
+// a genuine failure, which arrives on the bus rather than as a state result, surfaces
+// straight away instead of sitting out the whole deadline.
+func (r *gstRunner) awaitPreroll(pipeline uintptr, bus uintptr) (int32, error) {
+	deadline := time.Now().Add(pipelinePrerollTimeout)
+	for {
+		result := gstRuntime.elementGetState(pipeline, pipelineStateTimeout)
+		if result != gstStateChangeAsync {
+			return result, nil
+		}
+		if err := gstRuntime.popBusError(bus, 0); err != nil {
+			return result, err
+		}
+		if r.task != nil && r.task.IsDisposed() {
+			return result, nil
+		}
+		if !time.Now().Before(deadline) {
+			return result, nil
+		}
+	}
+}
+
 func (r *gstRunner) setPipelineState(pipeline uintptr, bus uintptr, state int32) error {
 	setResult := gstRuntime.elementSetState(pipeline, state)
 	if setResult == gstStateChangeFailure {
@@ -1424,7 +1460,10 @@ func (r *gstRunner) setPipelineState(pipeline uintptr, bus uintptr, state int32)
 		return fmt.Errorf("gstreamer failed to request state change to %d", state)
 	}
 
-	waitResult := gstRuntime.elementGetState(pipeline, pipelineStateTimeout)
+	waitResult, busErr := r.awaitPreroll(pipeline, bus)
+	if busErr != nil {
+		return busErr
+	}
 	switch waitResult {
 	case gstStateChangeSuccess, gstStateChangeNoPreroll:
 		return nil
