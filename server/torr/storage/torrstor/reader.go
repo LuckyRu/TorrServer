@@ -105,8 +105,10 @@ func (r *Reader) Read(p []byte) (n int, err error) {
 }
 
 func (r *Reader) SetReadahead(length int64) {
-	if r.cache != nil && length > r.cache.capacity {
-		length = r.cache.capacity
+	if r.cache != nil && length > 0 {
+		if capacity := r.cache.effectiveCapacity(); capacity > 0 && length > capacity {
+			length = capacity
+		}
 	}
 	if r.isUse {
 		r.Reader.SetReadahead(length)
@@ -156,8 +158,11 @@ func (r *Reader) getOffsetRange() (int64, int64) {
 		readers = 1
 	}
 
-	beginOffset := r.offset - (r.cache.capacity/readers)*(100-prc)/100
-	endOffset := r.offset + (r.cache.capacity/readers)*prc/100
+	// Capacity scales with the reader count, so this division gives each viewer the window
+	// a single viewer would have had rather than a shrinking share of one.
+	window := r.cache.effectiveCapacity() / readers
+	beginOffset := r.offset - window*(100-prc)/100
+	endOffset := r.offset + window*prc/100
 
 	if beginOffset < 0 {
 		beginOffset = 0
