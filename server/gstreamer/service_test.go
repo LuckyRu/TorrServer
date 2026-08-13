@@ -65,7 +65,7 @@ func TestGetOrAddDefendsFreshlyInstalledTaskFromSwap(t *testing.T) {
 	}
 
 	start := time.Now()
-	_, err := service.GetOrAdd(context.Background(), "hash", "2", 0)
+	_, err := service.GetOrAdd(context.Background(), "c:test", "hash", "2", 0)
 	elapsed := time.Since(start)
 
 	if !errors.Is(err, ErrTaskBusy) {
@@ -96,7 +96,7 @@ func TestGetOrAddStopsOnCancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	if _, err := service.GetOrAdd(ctx, "hash", "2", 0); !errors.Is(err, context.Canceled) {
+	if _, err := service.GetOrAdd(ctx, "c:test", "hash", "2", 0); !errors.Is(err, context.Canceled) {
 		t.Fatalf("GetOrAdd error=%v, want context.Canceled", err)
 	}
 }
@@ -347,7 +347,7 @@ func TestServiceDisposeRejectsFurtherWork(t *testing.T) {
 	if got := service.Get(task.ID); got != nil {
 		t.Fatal("disposed service returned a task")
 	}
-	if _, err := service.GetOrAdd(context.Background(), "hash", "1", 0); !errors.Is(err, ErrServiceClosed) {
+	if _, err := service.GetOrAdd(context.Background(), "c:test", "hash", "1", 0); !errors.Is(err, ErrServiceClosed) {
 		t.Fatalf("GetOrAdd error=%v, want ErrServiceClosed", err)
 	}
 	if _, err := service.Probe("hash", "1"); !errors.Is(err, ErrServiceClosed) {
