@@ -537,6 +537,132 @@ paths:
       summary: Gather informations using ffprobe
       tags:
       - API
+  /gst/{hash}/c/{token}/init.mp4:
+    get:
+      description: Requires a `-gst` build. Returns the fMP4 init segment for the
+        session.
+      parameters:
+      - description: Torrent infohash
+        in: path
+        name: hash
+        required: true
+        type: string
+      - description: Session token from master.m3u8
+        in: path
+        name: token
+        required: true
+        type: string
+      - description: Audio track index
+        in: query
+        name: audio
+        type: integer
+      - default: 0
+        description: Start offset in seconds
+        in: query
+        name: seconds
+        type: integer
+      produces:
+      - video/mp4
+      responses:
+        "200":
+          description: video/mp4 init segment
+          schema:
+            type: file
+        "404":
+          description: Session not found
+        "502":
+          description: Pipeline error
+          schema:
+            type: string
+      summary: HLS initialization segment
+      tags:
+      - GStreamer
+  /gst/{hash}/c/{token}/seg/{segment}:
+    get:
+      description: Requires a `-gst` build. Returns an fMP4 media segment for HLS
+        playback.
+      parameters:
+      - description: Torrent infohash
+        in: path
+        name: hash
+        required: true
+        type: string
+      - description: Session token from master.m3u8
+        in: path
+        name: token
+        required: true
+        type: string
+      - description: Segment index (e.g. 0.m4s)
+        in: path
+        name: segment
+        required: true
+        type: string
+      - description: Audio track index
+        in: query
+        name: audio
+        type: integer
+      produces:
+      - video/mp4
+      responses:
+        "200":
+          description: video/mp4 media segment
+          schema:
+            type: file
+        "206":
+          description: Partial content
+          schema:
+            type: file
+        "400":
+          description: Invalid segment
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Session not found
+        "502":
+          description: Pipeline error
+          schema:
+            type: string
+      summary: HLS media segment
+      tags:
+      - GStreamer
+  /gst/{hash}/c/{token}/video.m3u8:
+    get:
+      description: Requires a `-gst` build. The token comes from master.m3u8; its
+        links are relative and stay inside the session.
+      parameters:
+      - description: Torrent infohash
+        in: path
+        name: hash
+        required: true
+        type: string
+      - description: Session token from master.m3u8
+        in: path
+        name: token
+        required: true
+        type: string
+      - description: Audio track index
+        in: query
+        name: audio
+        type: integer
+      - default: 0
+        description: Start offset in seconds
+        in: query
+        name: seconds
+        type: integer
+      produces:
+      - application/vnd.apple.mpegurl
+      responses:
+        "200":
+          description: application/vnd.apple.mpegurl playlist
+          schema:
+            type: string
+        "404":
+          description: Session not found
+      summary: HLS variant playlist
+      tags:
+      - GStreamer
   /gst/{hash}/heartbeat:
     get:
       description: Requires a `-gst` build. Not available in standard binaries.
@@ -557,41 +683,6 @@ paths:
         "404":
           description: Task not found
       summary: GStreamer task heartbeat
-      tags:
-      - GStreamer
-  /gst/{hash}/init.mp4:
-    get:
-      description: Requires a `-gst` build. Returns the fMP4 init segment for the
-        transcode session.
-      parameters:
-      - description: Torrent infohash
-        in: path
-        name: hash
-        required: true
-        type: string
-      - description: Audio track index
-        in: query
-        name: audio
-        type: integer
-      - default: 0
-        description: Start offset in seconds
-        in: query
-        name: seconds
-        type: integer
-      produces:
-      - video/mp4
-      responses:
-        "200":
-          description: video/mp4 init segment
-          schema:
-            type: file
-        "404":
-          description: Task not found
-        "502":
-          description: Pipeline error
-          schema:
-            type: string
-      summary: HLS initialization segment
       tags:
       - GStreamer
   /gst/{hash}/master.m3u8:
@@ -626,15 +717,26 @@ paths:
         in: query
         name: seconds
         type: integer
+      - description: Stable device identifier; without one the client is identified
+          by address and user agent, and two devices behind one fingerprint share
+          a pipeline
+        in: query
+        name: client
+        type: string
       produces:
       - application/vnd.apple.mpegurl
       responses:
         "200":
-          description: application/vnd.apple.mpegurl playlist
+          description: application/vnd.apple.mpegurl playlist; every link below it
+            carries the session token
           schema:
             type: string
         "502":
           description: Pipeline error
+          schema:
+            type: string
+        "503":
+          description: Every session slot is in use
           schema:
             type: string
       summary: HLS master playlist
@@ -684,51 +786,6 @@ paths:
           schema:
             type: string
       summary: Probe torrent media tracks
-      tags:
-      - GStreamer
-  /gst/{hash}/seg/{segment}:
-    get:
-      description: Requires a `-gst` build. Returns an fMP4 media segment for HLS
-        playback.
-      parameters:
-      - description: Torrent infohash
-        in: path
-        name: hash
-        required: true
-        type: string
-      - description: Segment index (e.g. 0.m4s)
-        in: path
-        name: segment
-        required: true
-        type: string
-      - description: Audio track index
-        in: query
-        name: audio
-        type: integer
-      produces:
-      - video/mp4
-      responses:
-        "200":
-          description: video/mp4 media segment
-          schema:
-            type: file
-        "206":
-          description: Partial content
-          schema:
-            type: file
-        "400":
-          description: Invalid segment
-          schema:
-            additionalProperties:
-              type: string
-            type: object
-        "404":
-          description: Task not found
-        "502":
-          description: Pipeline error
-          schema:
-            type: string
-      summary: HLS media segment
       tags:
       - GStreamer
   /gst/echo:
