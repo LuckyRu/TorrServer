@@ -21,9 +21,9 @@ func (t *Torrent) Preload(index int, size int64) {
 	if size <= 0 {
 		return
 	}
-	t.PreloadSize = size
+	t.setPreloadSize(size)
 
-	if t.Stat == state.TorrentGettingInfo {
+	if t.Stat() == state.TorrentGettingInfo {
 		if !t.WaitInfo() {
 			return
 		}
@@ -32,23 +32,22 @@ func (t *Torrent) Preload(index int, size int64) {
 	}
 
 	t.muTorrent.Lock()
-	if t.Stat != state.TorrentWorking {
+	if t.Stat() != state.TorrentWorking {
 		t.muTorrent.Unlock()
 		return
 	}
 
-	t.Stat = state.TorrentPreload
+	t.setStat(state.TorrentPreload)
 	t.muTorrent.Unlock()
 
 	defer func() {
 		t.muTorrent.Lock()
-		if t.Stat == state.TorrentPreload {
-			t.Stat = state.TorrentWorking
+		if t.Stat() == state.TorrentPreload {
+			t.setStat(state.TorrentWorking)
 		}
 		t.muTorrent.Unlock()
-		// Очистка по окончании прелоада
-		t.BitRate = ""
-		t.DurationSeconds = 0
+		// Очистка по окончании прелоада.
+		t.setMediaInfo("", 0)
 	}()
 
 	file := t.findFileIndex(index)
@@ -82,7 +81,7 @@ func (t *Torrent) Preload(index int, size int64) {
 			select {
 			case <-ticker.C:
 				t.muTorrent.Lock()
-				stat := t.Stat
+				stat := t.Stat()
 				t.muTorrent.Unlock()
 
 				if stat != state.TorrentPreload {
@@ -110,14 +109,13 @@ func (t *Torrent) Preload(index int, size int64) {
 			link = "https://127.0.0.1:" + settings.SslPort + "/play/" + t.Hash().HexString() + "/" + strconv.Itoa(index)
 		}
 		if data, err := ffprobe.ProbeUrl(link); err == nil {
-			t.BitRate = data.Format.BitRate
-			t.DurationSeconds = data.Format.DurationSeconds
+			t.setMediaInfo(data.Format.BitRate, data.Format.DurationSeconds)
 		}
 	}
 
 	// Check if torrent was closed
 	t.muTorrent.Lock()
-	isClosed := t.Stat == state.TorrentClosed
+	isClosed := t.Stat() == state.TorrentClosed
 	t.muTorrent.Unlock()
 
 	if isClosed {
@@ -165,7 +163,7 @@ func (t *Torrent) Preload(index int, size int64) {
 
 			// Check if we should still preload
 			t.muTorrent.Lock()
-			shouldPreload := t.Stat == state.TorrentPreload
+			shouldPreload := t.Stat() == state.TorrentPreload
 			t.muTorrent.Unlock()
 
 			if !shouldPreload {
@@ -205,7 +203,7 @@ func (t *Torrent) Preload(index int, size int64) {
 
 				// Check if we should continue
 				t.muTorrent.Lock()
-				shouldContinue := t.Stat == state.TorrentPreload
+				shouldContinue := t.Stat() == state.TorrentPreload
 				t.muTorrent.Unlock()
 
 				if !shouldContinue {
@@ -228,11 +226,15 @@ func (t *Torrent) Preload(index int, size int64) {
 	for offset+int64(len(tmp)) < readerStartEnd {
 		// Check if we should continue
 		t.muTorrent.Lock()
-		shouldContinue := t.Stat == state.TorrentPreload
+		shouldContinue := t.Stat() == state.TorrentPreload
 		t.muTorrent.Unlock()
 
 		if !shouldContinue {
 			log.TLogln("Preload cancelled")
+			break
+		}
+		if t.preloadYieldsTo(file, size) {
+			log.TLogln("Preload yields to a stream reading elsewhere in the file:", t.Hash().HexString())
 			break
 		}
 
@@ -261,7 +263,7 @@ func (t *Torrent) Preload(index int, size int64) {
 
 	// Final log
 	t.muTorrent.Lock()
-	finalStat := t.Stat
+	finalStat := t.Stat()
 	t.muTorrent.Unlock()
 
 	if finalStat == state.TorrentPreload {
@@ -290,4 +292,19 @@ func (t *Torrent) findFileIndex(index int) *torrent.File {
 		}
 	}
 	return nil
+}
+
+// preloadYieldsTo reports whether somebody is streaming a part of the torrent this preload
+// is not fetching.
+//
+// Preload warms the head of the file, which is exactly what gst-discoverer reads, so
+// yielding to any reader at all starved the probe of the bytes the preload was fetching for
+// it. A reader positioned past what preload covers is a different matter: it wants other
+// bytes, so the two only compete for the torrent's connections, and the one a viewer is
+// waiting on should win.
+func (t *Torrent) preloadYieldsTo(file *torrent.File, coveredBytes int64) bool {
+	if t.cache == nil || file == nil {
+		return false
+	}
+	return t.cache.HasReaderPast(file.Offset() + coveredBytes)
 }

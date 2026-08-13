@@ -1,8 +1,10 @@
 package torrstor
 
 import (
+	"errors"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/anacrolix/torrent"
@@ -13,60 +15,85 @@ import (
 
 type Reader struct {
 	torrent.Reader
-	offset    int64
-	readahead int64
-	file      *torrent.File
+	// file is behind an interface so a reader can exist in a test without a torrent client
+	// behind it; see source.go.
+	file readerFile
+
+	// offset, readahead and isUse are written by the goroutine serving this stream and read
+	// by the cache maintenance that walks every reader of the torrent. Reader.mu orders the
+	// serving side against itself; it does not reach the maintenance side, so these have to
+	// carry their own synchronisation.
+	offset    atomic.Int64
+	readahead atomic.Int64
+	isUse     atomic.Bool
 
 	cache    *Cache
-	isClosed bool
+	isClosed atomic.Bool
+
+	// inFlight counts the reads and seeks currently inside the underlying reader. The idle
+	// sweep parks an unused reader at byte 0 to release its piece claims; doing that under a
+	// read in progress returns the head of the file to a caller that asked for its position,
+	// and a demuxer then parses the file header as mid-stream data. A read blocked on the
+	// swarm is exactly the case that matters: waiting for bytes is what makes a busy reader
+	// look idle. Registered under mu so readerOff and a starting read cannot overlap.
+	inFlight atomic.Int32
 
 	///Preload
-	lastAccess int64
-	isUse      bool
+	lastAccess atomic.Int64
 	mu         sync.Mutex
 }
 
-func newReader(file *torrent.File, cache *Cache) *Reader {
+// ErrTooManyReaders means the torrent already has as many readers as it can serve without
+// the readers starving each other. It is a refusal, not a failure of the source: a queue
+// would hold the HTTP connections open and only move the problem.
+var ErrTooManyReaders = errors.New("too many concurrent readers on this torrent")
+
+func newReader(file readerFile, cache *Cache) (*Reader, error) {
 	r := new(Reader)
 	r.file = file
 	r.Reader = file.NewReader()
 
-	r.SetReadahead(0)
 	r.cache = cache
-	r.isUse = true
+	r.isUse.Store(true)
+	r.SetReadahead(0)
 
-	cache.muReaders.Lock()
-	cache.readers[r] = struct{}{}
-	cache.muReaders.Unlock()
-	return r
+	if err := cache.admitReader(r); err != nil {
+		// The anacrolix reader is already open, and abandoning it would leave its piece
+		// claims behind.
+		_ = r.Reader.Close()
+		return nil, err
+	}
+	return r, nil
 }
 
 func (r *Reader) Seek(offset int64, whence int) (n int64, err error) {
-	if r.isClosed {
+	if r.isClosed.Load() {
 		return 0, io.EOF
 	}
 	switch whence {
 	case io.SeekStart:
-		r.offset = offset
+		r.offset.Store(offset)
 	case io.SeekCurrent:
-		r.offset += offset
+		r.offset.Add(offset)
 	case io.SeekEnd:
-		r.offset = r.file.Length() + offset
+		r.offset.Store(r.file.Length() + offset)
 	}
-	r.readerOn()
+	r.beginIO()
+	defer r.endIO()
 	n, err = r.Reader.Seek(offset, whence)
-	r.offset = n
-	r.lastAccess = time.Now().Unix()
+	r.offset.Store(n)
+	r.lastAccess.Store(time.Now().Unix())
 	return
 }
 
 func (r *Reader) Read(p []byte) (n int, err error) {
 	err = io.EOF
-	if r.isClosed {
+	if r.isClosed.Load() {
 		return
 	}
-	if r.file.Torrent() != nil && r.file.Torrent().Info() != nil {
-		r.readerOn()
+	if r.file.HasInfo() {
+		r.beginIO()
+		defer r.endIO()
 		n, err = r.Reader.Read(p)
 
 		// samsung tv fix xvid/divx
@@ -87,8 +114,8 @@ func (r *Reader) Read(p []byte) (n int, err error) {
 		//	}
 		//}
 
-		r.offset += int64(n)
-		r.lastAccess = time.Now().Unix()
+		r.offset.Add(int64(n))
+		r.lastAccess.Store(time.Now().Unix())
 	} else {
 		log.TLogln("Torrent closed and readed")
 	}
@@ -96,28 +123,30 @@ func (r *Reader) Read(p []byte) (n int, err error) {
 }
 
 func (r *Reader) SetReadahead(length int64) {
-	if r.cache != nil && length > r.cache.capacity {
-		length = r.cache.capacity
+	if r.cache != nil && length > 0 {
+		if capacity := r.cache.effectiveCapacity(); capacity > 0 && length > capacity {
+			length = capacity
+		}
 	}
-	if r.isUse {
+	if r.isUse.Load() {
 		r.Reader.SetReadahead(length)
 	}
-	r.readahead = length
+	r.readahead.Store(length)
 }
 
 func (r *Reader) Offset() int64 {
-	return r.offset
+	return r.offset.Load()
 }
 
 func (r *Reader) Readahead() int64 {
-	return r.readahead
+	return r.readahead.Load()
 }
 
 func (r *Reader) Close() {
 	// file reader close in gotorrent
 	// this struct close in cache
-	r.isClosed = true
-	if len(r.file.Torrent().Files()) > 0 {
+	r.isClosed.Store(true)
+	if r.file.HasFiles() {
 		r.Reader.Close()
 	}
 	go r.cache.getRemPieces()
@@ -129,11 +158,20 @@ func (r *Reader) getPiecesRange() Range {
 }
 
 func (r *Reader) getReaderPiece() int {
-	return r.getPieceNum(r.offset)
+	return r.getPieceNum(r.offset.Load())
 }
 
 func (r *Reader) getReaderRAHPiece() int {
-	return r.getPieceNum(r.offset + r.readahead)
+	return r.getPieceNum(r.offset.Load() + r.readahead.Load())
+}
+
+// absoluteOffset is this reader's position counted from the start of the torrent rather
+// than of its file, which is the only way positions in different files compare.
+func (r *Reader) absoluteOffset() int64 {
+	if r.file == nil {
+		return r.offset.Load()
+	}
+	return r.file.Offset() + r.offset.Load()
 }
 
 func (r *Reader) getPieceNum(offset int64) int {
@@ -147,8 +185,12 @@ func (r *Reader) getOffsetRange() (int64, int64) {
 		readers = 1
 	}
 
-	beginOffset := r.offset - (r.cache.capacity/readers)*(100-prc)/100
-	endOffset := r.offset + (r.cache.capacity/readers)*prc/100
+	// Capacity scales with the reader count, so this division gives each viewer the window
+	// a single viewer would have had rather than a shrinking share of one.
+	window := r.cache.effectiveCapacity() / readers
+	offset := r.offset.Load()
+	beginOffset := offset - window*(100-prc)/100
+	endOffset := offset + window*prc/100
 
 	if beginOffset < 0 {
 		beginOffset = 0
@@ -161,32 +203,57 @@ func (r *Reader) getOffsetRange() (int64, int64) {
 }
 
 func (r *Reader) checkReader() {
-	if time.Now().Unix() > r.lastAccess+60 && r.cache.Readers() > 1 {
+	if time.Now().Unix() > r.lastAccess.Load()+60 && r.cache.Readers() > 1 {
 		r.readerOff()
 	} else {
 		r.readerOn()
 	}
 }
 
+// beginIO claims the reader for one read or seek and undoes any parking the sweep did.
+// Claiming under mu is what makes it exclusive with readerOff: once readerOff holds mu and
+// has found nothing in flight, no read can start before it is finished.
+func (r *Reader) beginIO() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.inFlight.Add(1)
+	r.resume()
+}
+
+func (r *Reader) endIO() {
+	r.inFlight.Add(-1)
+}
+
 func (r *Reader) readerOn() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if !r.isUse {
+	r.resume()
+}
+
+// resume must be called with mu held.
+func (r *Reader) resume() {
+	if !r.isUse.Load() {
 		if pos, err := r.Reader.Seek(0, io.SeekCurrent); err == nil && pos == 0 {
-			r.Reader.Seek(r.offset, io.SeekStart)
+			r.Reader.Seek(r.offset.Load(), io.SeekStart)
 		}
-		r.SetReadahead(r.readahead)
-		r.isUse = true
+		r.isUse.Store(true)
+		r.SetReadahead(r.readahead.Load())
 	}
 }
 
 func (r *Reader) readerOff() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.isUse {
+	// A reader serving a request is not idle, whatever its last-access stamp says — the
+	// stamp is only written once the read returns, so one blocked on the swarm looks
+	// abandoned. Parking it here is what corrupts that read.
+	if r.inFlight.Load() > 0 {
+		return
+	}
+	if r.isUse.Load() {
 		r.SetReadahead(0)
-		r.isUse = false
-		if r.offset > 0 {
+		r.isUse.Store(false)
+		if r.offset.Load() > 0 {
 			r.Reader.Seek(0, io.SeekStart)
 		}
 	}

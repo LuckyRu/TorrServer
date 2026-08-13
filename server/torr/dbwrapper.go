@@ -58,7 +58,7 @@ func GetTorrentDB(hash metainfo.Hash) *Torrent {
 			torr.Timestamp = db.Timestamp
 			torr.Size = db.Size
 			torr.Data = db.Data
-			torr.Stat = state.TorrentInDB
+			torr.setStat(state.TorrentInDB)
 			return torr
 		}
 	}
@@ -81,7 +81,7 @@ func ListTorrentsDB() map[metainfo.Hash]*Torrent {
 		torr.Timestamp = db.Timestamp
 		torr.Size = db.Size
 		torr.Data = db.Data
-		torr.Stat = state.TorrentInDB
+		torr.setStat(state.TorrentInDB)
 		ret[torr.TorrentSpec.InfoHash] = torr
 	}
 	return ret

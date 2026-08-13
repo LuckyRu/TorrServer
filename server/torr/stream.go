@@ -18,6 +18,7 @@ import (
 	mt "server/mimetype"
 	sets "server/settings"
 	"server/torr/state"
+	"server/torr/storage/torrstor"
 )
 
 // Add atomic counter for concurrent streams
@@ -81,9 +82,15 @@ func (t *Torrent) Stream(fileID int, req *http.Request, resp http.ResponseWriter
 		return err
 	}
 	// Create reader with context for timeout
-	reader := t.NewReader(file)
-	if reader == nil {
-		return errors.New("cannot create torrent reader")
+	reader, err := t.NewReader(file)
+	if err != nil {
+		// The torrent is fine and the server is full: a 503 sends the client back in a
+		// moment instead of reporting the source as broken.
+		if errors.Is(err, torrstor.ErrTooManyReaders) {
+			resp.Header().Set("Retry-After", "5")
+			http.Error(resp, err.Error(), http.StatusServiceUnavailable)
+		}
+		return err
 	}
 	// Ensure reader is always closed
 	defer t.CloseReader(reader)
@@ -95,11 +102,19 @@ func (t *Torrent) Stream(fileID int, req *http.Request, resp http.ResponseWriter
 	host, port, clerr := net.SplitHostPort(req.RemoteAddr)
 
 	if sets.BTsets.EnableDebug {
+		// The requested byte range is the only thing that distinguishes one of a demuxer's
+		// many pull requests from the next. Without it a "file might be corrupt" error names
+		// a position in seconds and nothing that can be matched against what was served.
+		byteRange := req.Header.Get("Range")
+		if byteRange == "" {
+			byteRange = "full"
+		}
 		if clerr != nil {
-			log.Printf("[Stream:%d] Connect client (Active streams: %d)", streamID, atomic.LoadInt32(&activeStreams))
+			log.Printf("[Stream:%d] Connect client file=%d range=%s (Active streams: %d)",
+				streamID, fileID, byteRange, atomic.LoadInt32(&activeStreams))
 		} else {
-			log.Printf("[Stream:%d] Connect client %s:%s (Active streams: %d)",
-				streamID, host, port, atomic.LoadInt32(&activeStreams))
+			log.Printf("[Stream:%d] Connect client %s:%s file=%d range=%s (Active streams: %d)",
+				streamID, host, port, fileID, byteRange, atomic.LoadInt32(&activeStreams))
 		}
 	}
 

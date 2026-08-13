@@ -62,7 +62,7 @@ func loadTorrent(hash string) (*torr.Torrent, error) {
 		return nil, fmt.Errorf("torrent not found")
 	}
 	st := tor.Status()
-	if tor.Stat == state.TorrentInDB || (st != nil && len(st.FileStats) == 0) {
+	if tor.Stat() == state.TorrentInDB || (st != nil && len(st.FileStats) == 0) {
 		if loaded := torr.LoadTorrent(tor); loaded != nil {
 			return loaded, nil
 		}
@@ -78,7 +78,7 @@ func listSnapshots() []TorrentSnapshot {
 			continue
 		}
 		files := st.FileStats
-		if len(files) == 0 && t.Stat == state.TorrentInDB {
+		if len(files) == 0 && t.Stat() == state.TorrentInDB {
 			if loaded := torr.LoadTorrent(t); loaded != nil {
 				st = loaded.Status()
 				if st != nil {
