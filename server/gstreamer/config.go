@@ -16,6 +16,15 @@ const gstreamerSettingsKey = "gstreamer"
 
 const minGSTVersion = 1.22
 
+// defaultMaxTasks caps concurrent pipelines. It used to be unlimited, which was tolerable
+// while a task belonged to a torrent — there were only ever as many as there were torrents
+// being watched. A task now belongs to a session, and a household switching episodes mints
+// them far faster than the inactivity sweep reclaims them.
+//
+// Sized for a home: five devices plus room for one that has not been reclaimed yet. Set
+// MaxTasks to 0 to go back to unlimited.
+const defaultMaxTasks = 6
+
 type Config struct {
 	GSTVersion float64 `json:"GSTVersion"`
 	GSTPath    string  `json:"GSTPath"`
@@ -52,6 +61,7 @@ func defaultConfigWithoutSettings() Config {
 	conf := Config{
 		GSTVersion:           minGSTVersion,
 		Source:               "stream",
+		MaxTasks:             defaultMaxTasks,
 		InactiveMinutes:      5,
 		AACBitrateKbps:       256,
 		SegmentSeconds:       6,

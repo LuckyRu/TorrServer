@@ -16,6 +16,8 @@ func TestNormalizedConfigDefaultsToGStreamer122(t *testing.T) {
 	if conf.GSTVersion != 1.22 {
 		t.Fatalf("GSTVersion=%v, want 1.22", conf.GSTVersion)
 	}
+	// normalized() only clamps; an explicit 0 stays unlimited, and the limit is a default
+	// rather than a floor so anyone who wants it back can set it.
 	if conf.MaxTasks != 0 {
 		t.Fatalf("MaxTasks=%v, want 0 unlimited", conf.MaxTasks)
 	}
@@ -31,6 +33,9 @@ func TestPlatformDefaultsUseReleasePipelinePolicy(t *testing.T) {
 	conf := defaultConfigWithoutSettings().normalized()
 	if conf.SegmentDiff != 20 || !conf.Subtitles || !conf.HardwareAcceleration || !conf.UseGPU {
 		t.Fatalf("unexpected release defaults: %#v", conf)
+	}
+	if conf.MaxTasks != defaultMaxTasks {
+		t.Fatalf("MaxTasks=%v, want the session limit %v out of the box", conf.MaxTasks, defaultMaxTasks)
 	}
 }
 
