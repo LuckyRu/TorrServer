@@ -258,12 +258,15 @@ func (t *Torrent) Length() int64 {
 	return t.Torrent.Length()
 }
 
-func (t *Torrent) NewReader(file *torrent.File) *torrstor.Reader {
+// ErrTorrentClosed separates "this torrent is gone" from a reader refusal, so callers can
+// tell a permanent failure from one worth retrying.
+var ErrTorrentClosed = errors.New("torrent is closed")
+
+func (t *Torrent) NewReader(file *torrent.File) (*torrstor.Reader, error) {
 	if t.Stat == state.TorrentClosed {
-		return nil
+		return nil, ErrTorrentClosed
 	}
-	reader := t.cache.NewReader(file)
-	return reader
+	return t.cache.NewReader(file)
 }
 
 func (t *Torrent) CloseReader(reader *torrstor.Reader) {

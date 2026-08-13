@@ -18,6 +18,7 @@ import (
 	mt "server/mimetype"
 	sets "server/settings"
 	"server/torr/state"
+	"server/torr/storage/torrstor"
 )
 
 // Add atomic counter for concurrent streams
@@ -81,9 +82,15 @@ func (t *Torrent) Stream(fileID int, req *http.Request, resp http.ResponseWriter
 		return err
 	}
 	// Create reader with context for timeout
-	reader := t.NewReader(file)
-	if reader == nil {
-		return errors.New("cannot create torrent reader")
+	reader, err := t.NewReader(file)
+	if err != nil {
+		// The torrent is fine and the server is full: a 503 sends the client back in a
+		// moment instead of reporting the source as broken.
+		if errors.Is(err, torrstor.ErrTooManyReaders) {
+			resp.Header().Set("Retry-After", "5")
+			http.Error(resp, err.Error(), http.StatusServiceUnavailable)
+		}
+		return err
 	}
 	// Ensure reader is always closed
 	defer t.CloseReader(reader)

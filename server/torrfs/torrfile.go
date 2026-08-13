@@ -43,9 +43,9 @@ func NewTorrFile(parent INode, name string, file *torrent.File) *TorrFile {
 }
 
 func (f *TorrFile) Open(name string) (fs.File, error) {
-	r := f.Torrent().NewReader(f.file)
-	if r == nil {
-		return nil, fs.ErrInvalid
+	r, err := f.Torrent().NewReader(f.file)
+	if err != nil {
+		return nil, err
 	}
 	if sets.BTsets.ResponsiveMode {
 		r.SetResponsive()
