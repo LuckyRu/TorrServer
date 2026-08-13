@@ -508,9 +508,12 @@ func TestCreatePipelineArgsUsesX264Ultrafast(t *testing.T) {
 
 func TestSetPipelineStateRejectsAsyncTimeout(t *testing.T) {
 	previous := gstRuntime
+	previousPreroll := pipelinePrerollTimeout
 	t.Cleanup(func() {
 		gstRuntime = previous
+		pipelinePrerollTimeout = previousPreroll
 	})
+	pipelinePrerollTimeout = 0
 
 	gstRuntime = &gstAPI{
 		gstElementSetState: func(uintptr, int32) int32 {
@@ -527,6 +530,82 @@ func TestSetPipelineStateRejectsAsyncTimeout(t *testing.T) {
 	err := (&gstRunner{}).setPipelineState(1, 2, gstStatePlaying)
 	if err == nil || !strings.Contains(err.Error(), "timed out") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// The transition to PAUSED is a preroll against a torrent, so ASYNC on the first look is
+// the normal case, not a failure: the pieces have not arrived yet. Giving up there is what
+// made a freshly added torrent, or a seek into a part of the file nothing had downloaded,
+// fail every time.
+func TestSetPipelineStateWaitsOutAsyncPreroll(t *testing.T) {
+	previous := gstRuntime
+	previousPreroll := pipelinePrerollTimeout
+	t.Cleanup(func() {
+		gstRuntime = previous
+		pipelinePrerollTimeout = previousPreroll
+	})
+	pipelinePrerollTimeout = 10 * time.Second
+
+	looks := 0
+	gstRuntime = &gstAPI{
+		gstElementSetState: func(uintptr, int32) int32 {
+			return gstStateChangeAsync
+		},
+		gstElementGetState: func(uintptr, unsafe.Pointer, unsafe.Pointer, uint64) int32 {
+			looks++
+			if looks < 3 {
+				return gstStateChangeAsync
+			}
+			return gstStateChangeSuccess
+		},
+		gstBusTimedPopFiltered: func(uintptr, uint64, int32) uintptr {
+			return 0
+		},
+	}
+
+	if err := (&gstRunner{}).setPipelineState(1, 2, gstStatePaused); err != nil {
+		t.Fatalf("preroll that needed a few looks was reported as a failure: %v", err)
+	}
+	if looks < 3 {
+		t.Fatalf("gave up after %d looks", looks)
+	}
+}
+
+// A disposed pipeline has nobody waiting on it, so it must not sit out the deadline.
+func TestSetPipelineStateStopsWaitingOnceDisposed(t *testing.T) {
+	previous := gstRuntime
+	previousPreroll := pipelinePrerollTimeout
+	t.Cleanup(func() {
+		gstRuntime = previous
+		pipelinePrerollTimeout = previousPreroll
+	})
+	pipelinePrerollTimeout = time.Hour
+
+	task := &Task{}
+	task.Dispose()
+
+	gstRuntime = &gstAPI{
+		gstElementSetState: func(uintptr, int32) int32 {
+			return gstStateChangeAsync
+		},
+		gstElementGetState: func(uintptr, unsafe.Pointer, unsafe.Pointer, uint64) int32 {
+			return gstStateChangeAsync
+		},
+		gstBusTimedPopFiltered: func(uintptr, uint64, int32) uintptr {
+			return 0
+		},
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- (&gstRunner{task: task}).setPipelineState(1, 2, gstStatePaused) }()
+
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "timed out") {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("a disposed pipeline kept waiting on the swarm")
 	}
 }
 

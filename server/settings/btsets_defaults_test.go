@@ -29,6 +29,14 @@ func TestDefaultConfigSizesForAHousehold(t *testing.T) {
 	if sets.ConnectionsLimit != defaultConnectionsLimit {
 		t.Fatalf("ConnectionsLimit=%d, want %d", sets.ConnectionsLimit, defaultConnectionsLimit)
 	}
+
+	// The preload is a percentage of the cache and the viewer waits through all of it, so
+	// the two defaults are one decision: a bigger cache must not mean a longer black
+	// screen. Roughly 32 MB is what starts in time.
+	preload := sets.CacheSize / 100 * int64(sets.PreloadCache)
+	if preload < 24<<20 || preload > 40<<20 {
+		t.Fatalf("preload works out to %d MB, want it near 32", preload>>20)
+	}
 }
 
 // UseDisk is silently forced off without a path, so shipping one without the other would

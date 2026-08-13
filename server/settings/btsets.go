@@ -145,9 +145,16 @@ func SetBTSets(sets *BTSets) {
 //
 // The cache goes to disk because at this size holding it in RAM is the wrong trade: disk
 // is what there is a lot of, and the pieces are written once and read once.
+//
+// The preload percentage has to come down as the cache goes up, because it is a percentage
+// of the cache and the viewer waits through all of it before playback may start. At the
+// upstream 50% this cache would preload 128 MB, which took a minute and a half and kept the
+// pipeline from prerolling for the whole of it. 12% lands back on the ~32 MB the upstream
+// pair produced, which is the amount that demonstrably starts in time.
 const (
 	defaultCacheSize        = 256 * 1024 * 1024
 	defaultConnectionsLimit = 60
+	defaultPreloadCache     = 12
 	defaultCacheDirName     = "cache"
 )
 
@@ -182,7 +189,7 @@ func (v *BTSets) applyFailsafeDefaults() {
 func SetDefaultConfig() {
 	sets := new(BTSets)
 	sets.CacheSize = defaultCacheSize
-	sets.PreloadCache = 50
+	sets.PreloadCache = defaultPreloadCache
 	sets.ConnectionsLimit = defaultConnectionsLimit
 	// Without a path UseDisk is silently forced off, so the two go together.
 	if Path != "" {
