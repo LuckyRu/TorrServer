@@ -208,7 +208,7 @@ func (t *Torrent) Preload(index int, size int64) {
 				shouldContinue := t.Stat == state.TorrentPreload
 				t.muTorrent.Unlock()
 
-				if !shouldContinue || t.preloadYields() {
+				if !shouldContinue {
 					break
 				}
 			}
@@ -233,10 +233,6 @@ func (t *Torrent) Preload(index int, size int64) {
 
 		if !shouldContinue {
 			log.TLogln("Preload cancelled")
-			break
-		}
-		if t.preloadYields() {
-			log.TLogln("Preload yields to an open reader:", t.Hash().HexString())
 			break
 		}
 
@@ -294,21 +290,4 @@ func (t *Torrent) findFileIndex(index int) *torrent.File {
 		}
 	}
 	return nil
-}
-
-// preloadYields reports whether somebody has started actually streaming this torrent.
-//
-// Preload warms a torrent that nobody is watching yet. Once a reader is open, it stops
-// being a warm-up and becomes a competitor: it pulls the head of the file while the viewer
-// may be resuming somewhere else entirely, and both draw on the same connection budget.
-// Measured on a cold torrent with a resume 16 minutes in, that competition cost 33 seconds
-// before the first playlist could be served.
-//
-// Preload opens its readers straight from the torrent rather than through the cache, so it
-// does not count itself here.
-func (t *Torrent) preloadYields() bool {
-	if t.cache == nil {
-		return false
-	}
-	return t.cache.GetUseReaders() > 0
 }
