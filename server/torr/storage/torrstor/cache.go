@@ -338,8 +338,36 @@ func (c *Cache) isIdInFileBE(ranges []Range, id int) bool {
 // Reader section
 ////////
 
-func (c *Cache) NewReader(file *torrent.File) *Reader {
+// maxReadersPerTorrent bounds how many readers one torrent may have open at once.
+//
+// Both of a torrent's shared resources are divided by reader count. Piece priority is
+// literally ConnectionsLimit/readers in setLoadPriority, and getRemPieces refuses to evict
+// any piece that falls inside any reader's range. Enough readers at scattered offsets
+// therefore starve each other for connections and, at the same time, leave the cache with
+// nothing it is allowed to free.
+//
+// The limit sits above legitimate use — several viewers plus the short-lived readers that
+// probing, cue reading and preload open — and below the runaway case of a client opening a
+// range request per segment. It is a backstop, not a scheduling policy.
+const maxReadersPerTorrent = 12
+
+func (c *Cache) NewReader(file *torrent.File) (*Reader, error) {
 	return newReader(file, c)
+}
+
+// admitReader publishes a reader if the torrent can still serve one.
+//
+// The count is checked while holding the same lock that publishes the reader, so
+// simultaneous callers cannot all pass the check and overshoot the limit together.
+func (c *Cache) admitReader(r *Reader) error {
+	c.muReaders.Lock()
+	defer c.muReaders.Unlock()
+
+	if len(c.readers) >= maxReadersPerTorrent {
+		return ErrTooManyReaders
+	}
+	c.readers[r] = struct{}{}
+	return nil
 }
 
 func (c *Cache) GetUseReaders() int {

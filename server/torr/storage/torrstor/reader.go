@@ -1,6 +1,7 @@
 package torrstor
 
 import (
+	"errors"
 	"io"
 	"sync"
 	"time"
@@ -26,7 +27,12 @@ type Reader struct {
 	mu         sync.Mutex
 }
 
-func newReader(file *torrent.File, cache *Cache) *Reader {
+// ErrTooManyReaders means the torrent already has as many readers as it can serve without
+// the readers starving each other. It is a refusal, not a failure of the source: a queue
+// would hold the HTTP connections open and only move the problem.
+var ErrTooManyReaders = errors.New("too many concurrent readers on this torrent")
+
+func newReader(file *torrent.File, cache *Cache) (*Reader, error) {
 	r := new(Reader)
 	r.file = file
 	r.Reader = file.NewReader()
@@ -35,10 +41,13 @@ func newReader(file *torrent.File, cache *Cache) *Reader {
 	r.cache = cache
 	r.isUse = true
 
-	cache.muReaders.Lock()
-	cache.readers[r] = struct{}{}
-	cache.muReaders.Unlock()
-	return r
+	if err := cache.admitReader(r); err != nil {
+		// The anacrolix reader is already open, and abandoning it would leave its piece
+		// claims behind.
+		_ = r.Reader.Close()
+		return nil, err
+	}
+	return r, nil
 }
 
 func (r *Reader) Seek(offset int64, whence int) (n int64, err error) {

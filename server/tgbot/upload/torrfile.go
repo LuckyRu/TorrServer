@@ -65,9 +65,9 @@ func NewTorrFile(wrk *Worker, stFile *state.TorrentFileStat) (*TorrFile, error) 
 		return nil, fmt.Errorf("file size exceeded max allowed %d bytes", sets.MaxSize)
 	}
 
-	reader := t.NewReader(file)
-	if reader == nil {
-		return nil, errors.New("cannot create torrent reader")
+	reader, err := t.NewReader(file)
+	if err != nil {
+		return nil, err
 	}
 	if sets.BTsets != nil && sets.BTsets.ResponsiveMode {
 		reader.SetResponsive()
