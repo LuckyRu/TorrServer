@@ -67,7 +67,7 @@ func (s *Service) probe(c *gin.Context) {
 
 	probe, err := s.Probe(hash, fileID)
 	if err != nil {
-		gstSourceFailure(hash, fileID, 0, "probe request", err)
+		gstSourceFailure(clientID(c), hash, fileID, 0, "probe request", err)
 		abortWithSourceError(c, err)
 		return
 	}
@@ -81,10 +81,12 @@ func (s *Service) master(c *gin.Context) {
 	hash := c.Param("hash")
 	fileID := firstNonEmpty(c.Query("index"), c.Query("id"), c.Query("fileID"))
 	audio := parseQueryInt(c, "audio", 0)
+	client := clientID(c)
+	s.clients.note(client, hash, fileID, audio)
 
-	task, err := s.GetOrAdd(c.Request.Context(), hash, fileID, audio)
+	task, err := s.GetOrAdd(c.Request.Context(), client, hash, fileID, audio)
 	if err != nil {
-		gstSourceFailure(hash, fileID, audio, "master task creation", err)
+		gstSourceFailure(client, hash, fileID, audio, "master task creation", err)
 		abortWithSourceError(c, err)
 		return
 	}

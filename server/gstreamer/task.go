@@ -23,7 +23,12 @@ type pipelineRunner interface {
 }
 
 type Task struct {
-	ID        string
+	ID string
+
+	// ClientID is who asked for this task. It is not part of the identity yet — the task
+	// is still keyed by hash — so it answers "who started this" rather than "who owns it".
+	ClientID string
+
 	FileID    string
 	Audio     int
 	SourceURL string
@@ -63,10 +68,11 @@ type Task struct {
 	disposed atomic.Bool
 }
 
-func NewTask(id string, fileID string, audio int, sourceURL string, probe ProbeInfo, cue *CueTimeline, conf Config) (*Task, error) {
+func NewTask(id string, client string, fileID string, audio int, sourceURL string, probe ProbeInfo, cue *CueTimeline, conf Config) (*Task, error) {
 	now := time.Now().UTC()
 	task := &Task{
 		ID:              id,
+		ClientID:        client,
 		FileID:          fileID,
 		Audio:           audio,
 		SourceURL:       sourceURL,

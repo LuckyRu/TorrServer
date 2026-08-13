@@ -55,6 +55,8 @@ type Service struct {
 	gateMu sync.Mutex
 	gates  map[string]chan struct{}
 
+	clients clientRegistry
+
 	cleanupRunning atomic.Bool
 	disposed       atomic.Bool
 	stopCleanup    chan struct{}
@@ -122,7 +124,7 @@ func NewService(conf Config) *Service {
 	return service
 }
 
-func (s *Service) GetOrAdd(ctx context.Context, hash string, fileID string, audio int) (*Task, error) {
+func (s *Service) GetOrAdd(ctx context.Context, client string, hash string, fileID string, audio int) (*Task, error) {
 	if hash == "" || fileID == "" {
 		return nil, ErrBadSource
 	}
@@ -139,7 +141,7 @@ func (s *Service) GetOrAdd(ctx context.Context, hash string, fileID string, audi
 		// torrent into a single call hands one of the callers a task it did not ask for,
 		// which is what used to send it around this loop again.
 		value, err, _ := s.taskCalls.Do(taskCallKey(hash, fileID, audio), func() (any, error) {
-			return s.getOrAdd(ctx, hash, fileID, audio)
+			return s.getOrAdd(ctx, client, hash, fileID, audio)
 		})
 		if err != nil {
 			if !errors.Is(err, ErrTaskBusy) {
@@ -163,7 +165,7 @@ func (s *Service) GetOrAdd(ctx context.Context, hash string, fileID string, audi
 	return nil, ErrTaskBusy
 }
 
-func (s *Service) getOrAdd(ctx context.Context, hash string, fileID string, audio int) (*Task, error) {
+func (s *Service) getOrAdd(ctx context.Context, client string, hash string, fileID string, audio int) (*Task, error) {
 	if s.disposed.Load() {
 		return nil, ErrServiceClosed
 	}
@@ -193,7 +195,7 @@ func (s *Service) getOrAdd(ctx context.Context, hash string, fileID string, audi
 	}
 	cue := s.cueTimeline(ctx, conf, hash, fileID, sourceURL, probe)
 
-	task, err = NewTask(id, fileID, audio, sourceURL, probe, cue, conf)
+	task, err = NewTask(id, client, fileID, audio, sourceURL, probe, cue, conf)
 	if err != nil {
 		return nil, err
 	}
@@ -894,6 +896,7 @@ func (s *Service) cleanupInactive() {
 
 	s.cleanupProbeCache(now)
 	s.cleanupCueCache(now)
+	s.clients.cleanup(now)
 }
 
 func (s *Service) isCurrentTask(id string, expected *Task) bool {
