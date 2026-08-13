@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -33,7 +34,7 @@ func (r *masterInitRunner) EnsureInit(context.Context, int, int) error {
 }
 
 func (r *masterInitRunner) GetSegment(context.Context, int, int) (Segment, error) {
-	return Segment{}, nil
+	return Segment{Header: []byte{'m', 'o', 'o', 'f'}, Payloads: [][]byte{{'d', 'a', 't'}}}, nil
 }
 
 func (r *masterInitRunner) Seek(float64) bool { return true }
@@ -64,6 +65,10 @@ func TestSetupRouteDoesNotConflict(t *testing.T) {
 		"/gst/:hash/master.m3u8",
 		"/gst/:hash/init.mp4",
 		"/gst/:hash/seg/*segment",
+		"/gst/:hash/c/:token/video.m3u8",
+		"/gst/:hash/c/:token/init.mp4",
+		"/gst/:hash/c/:token/seg/*segment",
+		"/gst/:hash/c/:token/subs/*subtitle",
 	} {
 		if !registered["GET "+path] {
 			t.Fatalf("route for %s was not registered", path)
@@ -113,8 +118,9 @@ func TestHeartbeatReturnsTorrentDetailsResponse(t *testing.T) {
 	service := &Service{
 		conf: Config{}.normalized(),
 		tasks: map[string]*Task{
-			"hash": {
-				ID:         "hash",
+			"token": {
+				Token:      "token",
+				Hash:       "hash",
 				lastActive: time.Now().UTC(),
 			},
 		},
@@ -143,8 +149,10 @@ func TestMasterEnsuresInitBeforeWritingCodecMetadata(t *testing.T) {
 	router := gin.New()
 
 	conf := Config{}.normalized()
+	token := sessionToken("c:"+shortSum("test"), "hash", "1", 0)
 	task := &Task{
-		ID:              "hash",
+		Token:           token,
+		Hash:            "hash",
 		FileID:          "1",
 		Audio:           0,
 		Config:          conf,
@@ -163,12 +171,12 @@ func TestMasterEnsuresInitBeforeWritingCodecMetadata(t *testing.T) {
 	task.runner = runner
 	service := &Service{
 		conf:       conf,
-		tasks:      map[string]*Task{"hash": task},
+		tasks:      map[string]*Task{token: task},
 		probeCache: make(map[string]probeCacheEntry),
 	}
 	service.SetupRoute(router)
 
-	request := httptest.NewRequest(http.MethodGet, "/gst/hash/master.m3u8?index=1&audio=0", nil)
+	request := httptest.NewRequest(http.MethodGet, "/gst/hash/master.m3u8?index=1&audio=0&client=test", nil)
 	response := httptest.NewRecorder()
 	router.ServeHTTP(response, request)
 
@@ -181,6 +189,105 @@ func TestMasterEnsuresInitBeforeWritingCodecMetadata(t *testing.T) {
 	if !strings.Contains(response.Body.String(), `CODECS="hvc1.1.6.L153.B0,mp4a.40.2"`) {
 		t.Fatalf("master did not use codec metadata from init.mp4: %q", response.Body.String())
 	}
+}
+
+// The player never learns what a session is: it follows the URLs it is given. So the
+// check that matters is walking those URLs exactly as a player would — master.m3u8 to the
+// variant, then the variant's own relative links.
+func TestPlaylistLinksStayInsideTheSession(t *testing.T) {
+	gin.SetMode(gin.ReleaseMode)
+	router := gin.New()
+
+	conf := Config{}.normalized()
+	token := sessionToken("c:"+shortSum("test"), "hash", "1", 0)
+	task := &Task{
+		Token:           token,
+		Hash:            "hash",
+		FileID:          "1",
+		Config:          conf,
+		LastSentSegment: -1,
+		lastActive:      time.Now().UTC(),
+		Probe: ProbeInfo{
+			DurationNS: int64(30 * time.Second),
+			Tracks: []TrackInfo{
+				{Type: "video", CapsName: "video/x-h264", Width: 1920, Height: 1080},
+				{Type: "audio", Index: 0, CapsName: "audio/mpeg"},
+			},
+		},
+	}
+	task.runner = &masterInitRunner{task: task}
+
+	service := &Service{
+		conf:       conf,
+		tasks:      map[string]*Task{token: task},
+		probeCache: make(map[string]probeCacheEntry),
+	}
+	service.SetupRoute(router)
+
+	get := func(target string) *httptest.ResponseRecorder {
+		t.Helper()
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, target, nil))
+		if response.Code != http.StatusOK {
+			t.Fatalf("GET %s status=%d body=%q", target, response.Code, response.Body.String())
+		}
+		return response
+	}
+
+	master := get("/gst/hash/master.m3u8?index=1&audio=0&client=test")
+	variantURL := lastPlaylistURI(t, master.Body.String())
+	if !strings.HasPrefix(variantURL, "/gst/hash/c/"+token+"/") {
+		t.Fatalf("master pointed outside the session: %q", variantURL)
+	}
+
+	variant := get(variantURL)
+	body := variant.Body.String()
+	if !strings.Contains(body, `#EXT-X-MAP:URI="init.mp4`) || !strings.Contains(body, "\nseg/0.m4s\n") {
+		t.Fatalf("variant playlist should keep its own links relative: %q", body)
+	}
+
+	// Relative links resolve against the variant URL, which is how they inherit the token
+	// without the player ever handling it.
+	base, err := url.Parse(variantURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, relative := range []string{"init.mp4?audio=0", "seg/0.m4s"} {
+		reference, err := url.Parse(relative)
+		if err != nil {
+			t.Fatal(err)
+		}
+		get(base.ResolveReference(reference).String())
+	}
+
+	// The same links without a session are a legacy URL, and resolve only while this is
+	// the torrent's only session.
+	get("/gst/hash/video.m3u8?audio=0")
+
+	other, _ := newTrackedTask("other", time.Now().UTC())
+	service.tasks[other.Token] = other
+
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/gst/hash/video.m3u8?audio=0", nil))
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("ambiguous legacy URL status=%d, want 404", response.Code)
+	}
+
+	// The session URL is unaffected by how many other sessions exist.
+	get(variantURL)
+}
+
+func lastPlaylistURI(t *testing.T, playlist string) string {
+	t.Helper()
+
+	for _, line := range strings.Split(playlist, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" && !strings.HasPrefix(line, "#") {
+			return line
+		}
+	}
+	t.Fatalf("playlist carries no URI: %q", playlist)
+	return ""
 }
 
 func TestHLSBandwidthDoesNotOverflowForLargeFile(t *testing.T) {
