@@ -104,30 +104,7 @@ func SetBTSets(sets *BTSets) {
 	if ReadOnly {
 		return
 	}
-	// failsafe checks (use defaults)
-	if sets.CacheSize == 0 {
-		sets.CacheSize = 64 * 1024 * 1024
-	}
-	if sets.ConnectionsLimit == 0 {
-		sets.ConnectionsLimit = 25
-	}
-	if sets.TorrentDisconnectTimeout == 0 {
-		sets.TorrentDisconnectTimeout = 30
-	}
-
-	if sets.ReaderReadAHead < 5 {
-		sets.ReaderReadAHead = 5
-	}
-	if sets.ReaderReadAHead > 100 {
-		sets.ReaderReadAHead = 100
-	}
-
-	if sets.PreloadCache < 0 {
-		sets.PreloadCache = 0
-	}
-	if sets.PreloadCache > 100 {
-		sets.PreloadCache = 100
-	}
+	sets.applyFailsafeDefaults()
 
 	if sets.TorrentsSavePath == "" {
 		sets.UseDisk = false
@@ -159,11 +136,62 @@ func SetBTSets(sets *BTSets) {
 	tdb.Set("Settings", "BitTorr", buf)
 }
 
+// Defaults for a household rather than a single viewer.
+//
+// The upstream 64 MB and 25 connections are sized for one stream at a modest bitrate. A
+// 4K stream at ~50 Mbps drains 64 MB in about ten seconds, and the cache is then split
+// between everyone watching that torrent, so the numbers run out exactly when several
+// people are watching.
+//
+// The cache goes to disk because at this size holding it in RAM is the wrong trade: disk
+// is what there is a lot of, and the pieces are written once and read once.
+const (
+	defaultCacheSize        = 256 * 1024 * 1024
+	defaultConnectionsLimit = 60
+	defaultCacheDirName     = "cache"
+)
+
+// applyFailsafeDefaults fills in what a stored configuration left at zero, which is how a
+// config written before a setting existed arrives here.
+func (v *BTSets) applyFailsafeDefaults() {
+	if v.CacheSize == 0 {
+		v.CacheSize = defaultCacheSize
+	}
+	if v.ConnectionsLimit == 0 {
+		v.ConnectionsLimit = defaultConnectionsLimit
+	}
+	if v.TorrentDisconnectTimeout == 0 {
+		v.TorrentDisconnectTimeout = 30
+	}
+
+	if v.ReaderReadAHead < 5 {
+		v.ReaderReadAHead = 5
+	}
+	if v.ReaderReadAHead > 100 {
+		v.ReaderReadAHead = 100
+	}
+
+	if v.PreloadCache < 0 {
+		v.PreloadCache = 0
+	}
+	if v.PreloadCache > 100 {
+		v.PreloadCache = 100
+	}
+}
+
 func SetDefaultConfig() {
 	sets := new(BTSets)
-	sets.CacheSize = 64 * 1024 * 1024 // 64 MB
+	sets.CacheSize = defaultCacheSize
 	sets.PreloadCache = 50
-	sets.ConnectionsLimit = 25
+	sets.ConnectionsLimit = defaultConnectionsLimit
+	// Without a path UseDisk is silently forced off, so the two go together.
+	if Path != "" {
+		sets.TorrentsSavePath = filepath.Join(Path, defaultCacheDirName)
+		sets.UseDisk = true
+		// A disk cache that is never cleaned fills the disk: the files outlive the
+		// torrent that created them.
+		sets.RemoveCacheOnDrop = true
+	}
 	sets.RetrackersMode = 1
 	sets.TorrentDisconnectTimeout = 30
 	sets.ReaderReadAHead = 95 // 95%
