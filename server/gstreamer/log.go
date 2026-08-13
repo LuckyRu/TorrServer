@@ -66,7 +66,8 @@ func gstTaskLogPrefix(task *Task) string {
 	if task == nil {
 		return "hash=<nil>"
 	}
-	return fmt.Sprintf("hash=%s file=%s audio=%d client=%s", task.ID, task.FileID, task.Audio, orUnknownClient(task.ClientID))
+	return fmt.Sprintf("hash=%s file=%s audio=%d client=%s session=%s",
+		task.Hash, task.FileID, task.Audio, orUnknownClient(task.ClientID), task.Token)
 }
 
 func orUnknownClient(client string) string {

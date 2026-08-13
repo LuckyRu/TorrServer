@@ -23,10 +23,35 @@ func (s *Service) SetupRoute(route gin.IRouter) {
 	route.GET("/gst/:hash/heartbeat", s.heartbeat)
 	route.GET("/gst/:hash/probe", s.probe)
 	route.GET("/gst/:hash/master.m3u8", s.master)
+
+	// Everything below master.m3u8 is addressed inside a session. The token comes from the
+	// playlist master.m3u8 just handed out, so the player carries it without knowing it
+	// exists — no cookie, no header, nothing for a native player to lose.
+	route.GET("/gst/:hash/c/:token/video.m3u8", s.videoPlaylist)
+	route.GET("/gst/:hash/c/:token/init.mp4", s.initMP4)
+	route.GET("/gst/:hash/c/:token/seg/*segment", s.segment)
+	route.GET("/gst/:hash/c/:token/subs/*subtitle", s.subtitle)
+
+	// Kept for playlists handed out by an older build; see soleSessionForHash.
 	route.GET("/gst/:hash/video.m3u8", s.videoPlaylist)
 	route.GET("/gst/:hash/init.mp4", s.initMP4)
 	route.GET("/gst/:hash/seg/*segment", s.segment)
 	route.GET("/gst/:hash/subs/*subtitle", s.subtitle)
+}
+
+// resolveTask finds the session a request belongs to.
+func (s *Service) resolveTask(c *gin.Context) *Task {
+	hash := c.Param("hash")
+	token := c.Param("token")
+	if token == "" {
+		return s.soleSessionForHash(hash)
+	}
+
+	task := s.session(token)
+	if task == nil || task.Hash != hash {
+		return nil
+	}
+	return task
 }
 
 func (s *Service) remove(c *gin.Context) {
@@ -47,7 +72,7 @@ func (s *Service) remove(c *gin.Context) {
 
 func (s *Service) heartbeat(c *gin.Context) {
 	hash := c.Param("hash")
-	if s.Get(hash) == nil {
+	if !s.hasSessionForHash(hash) {
 		c.Status(http.StatusNotFound)
 		return
 	}
@@ -104,7 +129,7 @@ func (s *Service) master(c *gin.Context) {
 
 func (s *Service) videoPlaylist(c *gin.Context) {
 	noCache(c)
-	task := s.Get(c.Param("hash"))
+	task := s.resolveTask(c)
 	if task == nil {
 		c.Status(http.StatusNotFound)
 		return
@@ -117,7 +142,9 @@ func (s *Service) videoPlaylist(c *gin.Context) {
 func buildVariantPlaylist(task *Task, audio int, seconds int) string {
 	var playlist strings.Builder
 	playlist.WriteString("#EXTM3U\n#EXT-X-VERSION:7\n\n")
-	taskID := url.PathEscape(task.ID)
+	// Absolute URLs have to name the session explicitly; init.mp4 and seg/N.m4s below stay
+	// relative and inherit it from whichever video.m3u8 the player fetched.
+	sessionPath := taskSessionPath(task)
 	hasSubtitles := false
 	if task.Config.Subtitles {
 		for _, track := range task.Probe.Tracks {
@@ -134,8 +161,8 @@ func buildVariantPlaylist(task *Task, audio int, seconds int) string {
 			playlist.WriteString(hlsQuoted(name))
 			playlist.WriteString("\",LANGUAGE=\"")
 			playlist.WriteString(language)
-			playlist.WriteString("\",DEFAULT=NO,AUTOSELECT=YES,FORCED=NO,URI=\"/gst/")
-			playlist.WriteString(taskID)
+			playlist.WriteString("\",DEFAULT=NO,AUTOSELECT=YES,FORCED=NO,URI=\"")
+			playlist.WriteString(sessionPath)
 			playlist.WriteString("/subs/")
 			playlist.WriteString(strconv.Itoa(track.Index))
 			playlist.WriteString(".m3u8\"\n")
@@ -202,8 +229,8 @@ func buildVariantPlaylist(task *Task, audio int, seconds int) string {
 	if hasSubtitles {
 		playlist.WriteString(",SUBTITLES=\"subs\"")
 	}
-	playlist.WriteString("\n/gst/")
-	playlist.WriteString(taskID)
+	playlist.WriteByte('\n')
+	playlist.WriteString(sessionPath)
 	playlist.WriteString("/video.m3u8?audio=")
 	playlist.WriteString(strconv.Itoa(audio))
 	if seconds > 0 {
@@ -212,6 +239,10 @@ func buildVariantPlaylist(task *Task, audio int, seconds int) string {
 	}
 	playlist.WriteByte('\n')
 	return playlist.String()
+}
+
+func taskSessionPath(task *Task) string {
+	return "/gst/" + url.PathEscape(task.Hash) + "/c/" + url.PathEscape(task.Token)
 }
 
 func (t *Task) hlsBandwidth() (int64, int64) {
@@ -322,7 +353,7 @@ func buildTaskPlaylist(task *Task, startIndex int, audio int) string {
 func (s *Service) initMP4(c *gin.Context) {
 	noCache(c)
 
-	task := s.Get(c.Param("hash"))
+	task := s.resolveTask(c)
 	if task == nil {
 		c.Status(http.StatusNotFound)
 		return
@@ -353,7 +384,7 @@ func (s *Service) initMP4(c *gin.Context) {
 func (s *Service) segment(c *gin.Context) {
 	noCache(c)
 
-	task := s.Get(c.Param("hash"))
+	task := s.resolveTask(c)
 	if task == nil {
 		c.Status(http.StatusNotFound)
 		return
@@ -391,7 +422,7 @@ func (s *Service) segment(c *gin.Context) {
 
 func (s *Service) subtitle(c *gin.Context) {
 	noCache(c)
-	task := s.Get(c.Param("hash"))
+	task := s.resolveTask(c)
 	if task == nil {
 		c.Status(http.StatusNotFound)
 		return
@@ -609,10 +640,10 @@ func abortWithSourceError(c *gin.Context, err error) {
 		c.String(http.StatusGatewayTimeout, err.Error())
 		return
 	}
-	// Contention for the hash's single task slot, not a broken source: tell the player
-	// to come back rather than reporting the upstream as bad.
-	if errors.Is(err, ErrTaskBusy) {
-		c.Header("Retry-After", "1")
+	// Every session slot is somebody's running playback, so the source is fine and the
+	// server is full: tell the player to come back instead of blaming the upstream.
+	if errors.Is(err, ErrTooManySessions) {
+		c.Header("Retry-After", "5")
 		c.String(http.StatusServiceUnavailable, err.Error())
 		return
 	}

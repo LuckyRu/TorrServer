@@ -1243,29 +1243,6 @@ func TestGstRunnerFreezeReleasesTransientState(t *testing.T) {
 	}
 }
 
-func TestDetachTaskDoesNotRemoveReplacement(t *testing.T) {
-	oldTask := &Task{}
-	newTask := &Task{}
-
-	service := &Service{
-		tasks: map[string]*Task{
-			"id": newTask,
-		},
-	}
-
-	if _, ok := service.detachTask("id", oldTask); ok {
-		t.Fatal("old snapshot removed replacement task")
-	}
-
-	service.mu.RLock()
-	current := service.tasks["id"]
-	service.mu.RUnlock()
-
-	if current != newTask {
-		t.Fatal("replacement task was removed")
-	}
-}
-
 func TestProbeCacheReturnsFreshCopy(t *testing.T) {
 	service := &Service{probeCache: make(map[string]probeCacheEntry)}
 	probe := ProbeInfo{
