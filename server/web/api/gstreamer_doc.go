@@ -134,23 +134,40 @@ func ProbeGStreamerSourceDoc() {}
 // @Param fileID query string false "File index (alias)"
 // @Param audio query int false "Audio track index" default(0)
 // @Param seconds query int false "Start offset in seconds" default(0)
-// @Success 200 {string} string "application/vnd.apple.mpegurl playlist"
+// @Param client query string false "Stable device identifier; without one the client is identified by address and user agent, and two devices behind one fingerprint share a pipeline"
+// @Success 200 {string} string "application/vnd.apple.mpegurl playlist; every link below it carries the session token"
 // @Failure 502 {string} string "Pipeline error"
+// @Failure 503 {string} string "Every session slot is in use"
 // @Router /gst/{hash}/master.m3u8 [get]
 func GetGStreamerMasterPlaylistDoc() {}
 
+// GetGStreamerVariantPlaylistDoc godoc
+// @Summary HLS variant playlist
+// @Description Requires a `-gst` build. The token comes from master.m3u8; its links are relative and stay inside the session.
+// @Tags GStreamer
+// @Produce application/vnd.apple.mpegurl
+// @Param hash path string true "Torrent infohash"
+// @Param token path string true "Session token from master.m3u8"
+// @Param audio query int false "Audio track index"
+// @Param seconds query int false "Start offset in seconds" default(0)
+// @Success 200 {string} string "application/vnd.apple.mpegurl playlist"
+// @Failure 404 "Session not found"
+// @Router /gst/{hash}/c/{token}/video.m3u8 [get]
+func GetGStreamerVariantPlaylistDoc() {}
+
 // GetGStreamerInitSegmentDoc godoc
 // @Summary HLS initialization segment
-// @Description Requires a `-gst` build. Returns the fMP4 init segment for the transcode session.
+// @Description Requires a `-gst` build. Returns the fMP4 init segment for the session.
 // @Tags GStreamer
 // @Produce video/mp4
 // @Param hash path string true "Torrent infohash"
+// @Param token path string true "Session token from master.m3u8"
 // @Param audio query int false "Audio track index"
 // @Param seconds query int false "Start offset in seconds" default(0)
 // @Success 200 {file} file "video/mp4 init segment"
-// @Failure 404 "Task not found"
+// @Failure 404 "Session not found"
 // @Failure 502 {string} string "Pipeline error"
-// @Router /gst/{hash}/init.mp4 [get]
+// @Router /gst/{hash}/c/{token}/init.mp4 [get]
 func GetGStreamerInitSegmentDoc() {}
 
 // GetGStreamerMediaSegmentDoc godoc
@@ -159,12 +176,13 @@ func GetGStreamerInitSegmentDoc() {}
 // @Tags GStreamer
 // @Produce video/mp4
 // @Param hash path string true "Torrent infohash"
+// @Param token path string true "Session token from master.m3u8"
 // @Param segment path string true "Segment index (e.g. 0.m4s)"
 // @Param audio query int false "Audio track index"
 // @Success 200 {file} file "video/mp4 media segment"
 // @Success 206 {file} file "Partial content"
 // @Failure 400 {object} map[string]string "Invalid segment"
-// @Failure 404 "Task not found"
+// @Failure 404 "Session not found"
 // @Failure 502 {string} string "Pipeline error"
-// @Router /gst/{hash}/seg/{segment} [get]
+// @Router /gst/{hash}/c/{token}/seg/{segment} [get]
 func GetGStreamerMediaSegmentDoc() {}

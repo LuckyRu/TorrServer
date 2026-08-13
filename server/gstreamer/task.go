@@ -23,10 +23,11 @@ type pipelineRunner interface {
 }
 
 type Task struct {
-	ID string
-
-	// ClientID is who asked for this task. It is not part of the identity yet — the task
-	// is still keyed by hash — so it answers "who started this" rather than "who owns it".
+	// Token identifies the session — one client watching one file — and is what the
+	// service keys tasks by. Hash is kept alongside it because the torrent layer and the
+	// logs still think in torrents.
+	Token    string
+	Hash     string
 	ClientID string
 
 	FileID    string
@@ -36,8 +37,6 @@ type Task struct {
 	Cue       *CueTimeline
 	Config    Config
 
-	// CreatedAt separates "freshly installed in the slot" from "has been watched for a
-	// while", which is how the service tells a swap fight from an episode switch.
 	CreatedAt time.Time
 
 	// AcquireTorrent keeps pipeline startup off the torrent while probing or cue reading
@@ -68,10 +67,11 @@ type Task struct {
 	disposed atomic.Bool
 }
 
-func NewTask(id string, client string, fileID string, audio int, sourceURL string, probe ProbeInfo, cue *CueTimeline, conf Config) (*Task, error) {
+func NewTask(token string, hash string, client string, fileID string, audio int, sourceURL string, probe ProbeInfo, cue *CueTimeline, conf Config) (*Task, error) {
 	now := time.Now().UTC()
 	task := &Task{
-		ID:              id,
+		Token:           token,
+		Hash:            hash,
 		ClientID:        client,
 		FileID:          fileID,
 		Audio:           audio,

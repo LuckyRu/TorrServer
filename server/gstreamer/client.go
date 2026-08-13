@@ -51,10 +51,15 @@ func isDerivedClientID(client string) bool {
 	return strings.HasPrefix(client, "d:")
 }
 
-// sessionToken is deterministic on purpose: a player re-requests master.m3u8 after every
-// error, and a random token would hand it a fresh pipeline each time.
-func sessionToken(client string, fileID string, audio int) string {
-	return shortSum(client + "\x00" + fileID + "\x00" + strconv.Itoa(audio))
+// sessionToken names one client's stream of one file: the session is what a pipeline
+// belongs to.
+//
+// Deterministic on purpose — a player re-requests master.m3u8 after every error, and a
+// random token would hand it a fresh pipeline each time. The hash takes part even though
+// the URL carries it separately, because the token alone keys the task map and file 3 of
+// two different torrents must not land on one entry.
+func sessionToken(client string, hash string, fileID string, audio int) string {
+	return shortSum(client + "\x00" + hash + "\x00" + fileID + "\x00" + strconv.Itoa(audio))
 }
 
 func shortSum(value string) string {

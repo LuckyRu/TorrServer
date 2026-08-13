@@ -72,18 +72,19 @@ func TestClientIDWithoutRequest(t *testing.T) {
 }
 
 func TestSessionTokenIsDeterministic(t *testing.T) {
-	first := sessionToken("c:abc", "3", 0)
-	if first != sessionToken("c:abc", "3", 0) {
+	first := sessionToken("c:abc", "hash", "3", 0)
+	if first != sessionToken("c:abc", "hash", "3", 0) {
 		t.Fatal("a repeated master request must resolve to the same session")
 	}
 
 	for _, other := range []string{
-		sessionToken("c:abd", "3", 0),
-		sessionToken("c:abc", "4", 0),
-		sessionToken("c:abc", "3", 1),
+		sessionToken("c:abd", "hash", "3", 0),
+		sessionToken("c:abc", "other", "3", 0),
+		sessionToken("c:abc", "hash", "4", 0),
+		sessionToken("c:abc", "hash", "3", 1),
 	} {
 		if other == first {
-			t.Fatal("client, file and audio must all take part in the token")
+			t.Fatal("client, hash, file and audio must all take part in the token")
 		}
 	}
 }

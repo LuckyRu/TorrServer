@@ -32,7 +32,7 @@ var (
 	ErrInvalidIdentifier       = errors.New("invalid gstreamer task id")
 	ErrEarlyEndOfStream        = errors.New("gstreamer reached EOS before the expected end")
 	ErrEndOfStreamExhausted    = errors.New("gstreamer end of stream is exhausted")
-	ErrTaskBusy                = errors.New("gstreamer task slot is busy")
+	ErrTooManySessions         = errors.New("too many gstreamer sessions are already playing")
 	ErrTruncatedMP4Fragment    = errors.New("truncated mp4 fragment at end of stream")
 	ErrUndecodableEOSRemainder = errors.New("undecodable mp4 eos remainder")
 )
@@ -40,7 +40,9 @@ var (
 type Service struct {
 	conf Config
 
-	mu    sync.RWMutex
+	mu sync.RWMutex
+	// Keyed by session token, not by hash: a pipeline belongs to one client watching one
+	// file, so two clients on one torrent no longer share, or fight over, a single slot.
 	tasks map[string]*Task
 
 	probeMu    sync.Mutex
@@ -65,12 +67,10 @@ type Service struct {
 const (
 	probeCacheTTL = time.Hour
 
-	// A hash owns exactly one task slot, so two clients wanting different files of the
-	// same torrent contend for it. Bound the contention instead of letting them evict
-	// each other indefinitely.
-	taskSwapAttempts = 3
-	taskSwapBackoff  = 150 * time.Millisecond
-	taskSwapGrace    = 2 * time.Second
+	// A session served this recently is somebody's running playback, and evicting it to
+	// make room would be visible as a stall. Past the limit with nothing older than this,
+	// the honest answer is to refuse the newcomer.
+	sessionActiveGrace = 15 * time.Second
 
 	cueCacheTTL         = probeCacheTTL
 	cueNegativeCacheTTL = time.Minute
@@ -124,69 +124,46 @@ func NewService(conf Config) *Service {
 	return service
 }
 
+// GetOrAdd resolves the caller's session, creating its pipeline if this is the first
+// request of that session.
+//
+// There is no contention to resolve here any more: the session token already separates
+// clients, so two of them can never be asking for the same task unless they really are
+// the same client asking twice.
 func (s *Service) GetOrAdd(ctx context.Context, client string, hash string, fileID string, audio int) (*Task, error) {
 	if hash == "" || fileID == "" {
 		return nil, ErrBadSource
 	}
-
-	for attempt := 0; attempt < taskSwapAttempts; attempt++ {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		if s.disposed.Load() {
-			return nil, ErrServiceClosed
-		}
-
-		// Keyed by the full request, not by hash: collapsing two different files of one
-		// torrent into a single call hands one of the callers a task it did not ask for,
-		// which is what used to send it around this loop again.
-		value, err, _ := s.taskCalls.Do(taskCallKey(hash, fileID, audio), func() (any, error) {
-			return s.getOrAdd(ctx, client, hash, fileID, audio)
-		})
-		if err != nil {
-			if !errors.Is(err, ErrTaskBusy) {
-				return nil, err
-			}
-		} else if task, ok := value.(*Task); !ok {
-			return nil, errors.New("gstreamer task creation returned an invalid result")
-		} else if taskMatchesRequest(task, hash, fileID, audio) {
-			return task, nil
-		}
-
-		// Either the slot was defended against us or someone swapped it out between
-		// creation and return. Both are contention, so back off rather than spin.
-		if attempt < taskSwapAttempts-1 {
-			if waitErr := sleepContext(ctx, taskSwapBackoff); waitErr != nil {
-				return nil, waitErr
-			}
-		}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if s.disposed.Load() {
+		return nil, ErrServiceClosed
 	}
 
-	return nil, ErrTaskBusy
+	token := sessionToken(client, hash, fileID, audio)
+	value, err, _ := s.taskCalls.Do(token, func() (any, error) {
+		return s.getOrAdd(ctx, token, client, hash, fileID, audio)
+	})
+	if err != nil {
+		return nil, err
+	}
+	task, ok := value.(*Task)
+	if !ok || task == nil {
+		return nil, errors.New("gstreamer task creation returned an invalid result")
+	}
+	return task, nil
 }
 
-func (s *Service) getOrAdd(ctx context.Context, client string, hash string, fileID string, audio int) (*Task, error) {
+func (s *Service) getOrAdd(ctx context.Context, token string, client string, hash string, fileID string, audio int) (*Task, error) {
 	if s.disposed.Load() {
 		return nil, ErrServiceClosed
 	}
 	conf := s.currentConfig()
 	sourceURL := sourceURL(conf, hash, fileID)
-	id := hash
 
-	s.mu.RLock()
-	task := s.tasks[id]
-	if task != nil && task.FileID == fileID && task.Audio == audio && !task.IsDisposed() {
-		task.UpdateLastActive()
-		s.mu.RUnlock()
+	if task := s.session(token); task != nil {
 		return task, nil
-	}
-	blocked := swapDefended(task)
-	s.mu.RUnlock()
-
-	// Bail before the expensive part: probing and reading a cue timeline for a task we
-	// will not be allowed to install is pure waste.
-	if blocked {
-		return nil, ErrTaskBusy
 	}
 
 	probe, err := s.Probe(hash, fileID)
@@ -195,14 +172,11 @@ func (s *Service) getOrAdd(ctx context.Context, client string, hash string, file
 	}
 	cue := s.cueTimeline(ctx, conf, hash, fileID, sourceURL, probe)
 
-	task, err = NewTask(id, client, fileID, audio, sourceURL, probe, cue, conf)
+	task, err := NewTask(token, hash, client, fileID, audio, sourceURL, probe, cue, conf)
 	if err != nil {
 		return nil, err
 	}
-	task.AcquireTorrent = func() func() { return s.acquireTorrentWithin(id, pipelineGateWait) }
-
-	var replaced *Task
-	var evicted []*Task
+	task.AcquireTorrent = func() func() { return s.acquireTorrentWithin(hash, pipelineGateWait) }
 
 	s.mu.Lock()
 	if s.disposed.Load() {
@@ -210,26 +184,23 @@ func (s *Service) getOrAdd(ctx context.Context, client string, hash string, file
 		task.Dispose()
 		return nil, ErrServiceClosed
 	}
-	existing := s.tasks[id]
-	if existing != nil &&
-		existing.FileID == fileID &&
-		existing.Audio == audio &&
-		!existing.IsDisposed() {
-		existing.UpdateLastActive()
-		s.mu.Unlock()
-
-		task.Dispose()
-		return existing, nil
-	}
-	if swapDefended(existing) {
+	// Only a disposed leftover can sit on this token; a live one was returned above.
+	replaced := s.tasks[token]
+	if replaced != nil && !replaced.IsDisposed() {
+		replaced.UpdateLastActive()
 		s.mu.Unlock()
 		task.Dispose()
-		return nil, ErrTaskBusy
+		return replaced, nil
 	}
-
-	replaced = existing
-	s.tasks[id] = task
-	evicted = s.evictTasksForLimitLocked(id)
+	if replaced == nil {
+		if err := s.admitSessionLocked(); err != nil {
+			s.mu.Unlock()
+			task.Dispose()
+			return nil, err
+		}
+	}
+	s.tasks[token] = task
+	evicted := s.evictTasksForLimitLocked(token)
 	s.mu.Unlock()
 
 	if replaced != nil {
@@ -240,23 +211,25 @@ func (s *Service) getOrAdd(ctx context.Context, client string, hash string, file
 	return task, nil
 }
 
-// swapDefended reports whether evicting task right now would most likely be one half of
-// a swap fight rather than a viewer switching episodes.
+// admitSessionLocked refuses a new session when every existing one is somebody's running
+// playback and the limit is reached.
 //
-// The signal is that the task is both freshly created and still being served: a task
-// somebody has actually been watching has an old CreatedAt and is evicted immediately,
-// so ordinary episode switches stay instant. Two clients trading the slot back and forth
-// only ever see fresh tasks, and get throttled to one swap per grace period.
-func swapDefended(task *Task) bool {
-	if task == nil || task.IsDisposed() {
-		return false
+// Eviction alone would be wrong here: with a task per session rather than per torrent,
+// making room means stalling a viewer who is watching right now. Refusing is a 503 the
+// player retries; evicting is a picture that stops.
+func (s *Service) admitSessionLocked() error {
+	limit := s.conf.normalized().MaxTasks
+	if limit <= 0 || len(s.tasks) < limit {
+		return nil
 	}
-	now := time.Now().UTC()
-	return now.Sub(task.CreatedAt) < taskSwapGrace && now.Sub(task.LastActive()) < taskSwapGrace
-}
 
-func taskCallKey(hash string, fileID string, audio int) string {
-	return hash + "\x00" + fileID + "\x00" + strconv.Itoa(audio)
+	cutoff := time.Now().UTC().Add(-sessionActiveGrace)
+	for _, task := range s.tasks {
+		if task == nil || task.IsDisposed() || task.LastActive().Before(cutoff) {
+			return nil
+		}
+	}
+	return ErrTooManySessions
 }
 
 // acquireTorrent serialises the operations that each open their own TorrServer reader:
@@ -318,22 +291,6 @@ func (s *Service) torrentGate(hash string) chan struct{} {
 		s.gates[hash] = gate
 	}
 	return gate
-}
-
-func sleepContext(ctx context.Context, delay time.Duration) error {
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
-}
-
-func taskMatchesRequest(task *Task, hash string, fileID string, audio int) bool {
-	return task != nil && !task.IsDisposed() && task.ID == hash && task.FileID == fileID && task.Audio == audio
 }
 
 func shouldUseCueTimeline(conf Config, probe ProbeInfo) bool {
@@ -746,13 +703,14 @@ func cloneProbeInfo(probe ProbeInfo) ProbeInfo {
 	return probe
 }
 
-func (s *Service) Get(id string) *Task {
-	if id == "" || s.disposed.Load() {
+// session resolves a session token to its task.
+func (s *Service) session(token string) *Task {
+	if token == "" || s.disposed.Load() {
 		return nil
 	}
 
 	s.mu.RLock()
-	task := s.tasks[id]
+	task := s.tasks[token]
 	if task == nil || task.IsDisposed() {
 		s.mu.RUnlock()
 		return nil
@@ -762,31 +720,74 @@ func (s *Service) Get(id string) *Task {
 	return task
 }
 
-func (s *Service) TryRemove(id string) bool {
-	task, ok := s.detachTask(id, nil)
-	if !ok {
+// soleSessionForHash serves URLs that predate the session segment in the path.
+//
+// Such URLs only ever come from a playlist a previous build handed out, so resolving them
+// is a courtesy, not a contract: with exactly one session on the torrent the answer is
+// unambiguous, and with more than one a 404 sends the player back to master.m3u8 for
+// links that carry a token.
+func (s *Service) soleSessionForHash(hash string) *Task {
+	if hash == "" || s.disposed.Load() {
+		return nil
+	}
+
+	s.mu.RLock()
+	var found *Task
+	for _, task := range s.tasks {
+		if task == nil || task.IsDisposed() || task.Hash != hash {
+			continue
+		}
+		if found != nil {
+			s.mu.RUnlock()
+			return nil
+		}
+		found = task
+	}
+	if found == nil {
+		s.mu.RUnlock()
+		return nil
+	}
+	found.UpdateLastActive()
+	s.mu.RUnlock()
+	return found
+}
+
+func (s *Service) hasSessionForHash(hash string) bool {
+	if hash == "" || s.disposed.Load() {
 		return false
 	}
 
-	task.Dispose()
-	return true
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, task := range s.tasks {
+		if task != nil && !task.IsDisposed() && task.Hash == hash {
+			return true
+		}
+	}
+	return false
 }
 
-func (s *Service) detachTask(id string, expected *Task) (*Task, bool) {
-	if id == "" {
-		return nil, false
+// TryRemove drops every session of a torrent: callers ask by hash because they are
+// removing the torrent, not one viewer's stream of it.
+func (s *Service) TryRemove(hash string) bool {
+	if hash == "" {
+		return false
 	}
 
 	s.mu.Lock()
-	task := s.tasks[id]
-	if task == nil || (expected != nil && task != expected) {
-		s.mu.Unlock()
-		return nil, false
+	var removed []*Task
+	for token, task := range s.tasks {
+		if task == nil || task.Hash == hash {
+			delete(s.tasks, token)
+			if task != nil {
+				removed = append(removed, task)
+			}
+		}
 	}
-
-	delete(s.tasks, id)
 	s.mu.Unlock()
-	return task, true
+
+	disposeTasks(removed)
+	return len(removed) > 0
 }
 
 func (s *Service) tryRemoveExpectedInactive(id string, expected *Task, cutoff time.Time) bool {
