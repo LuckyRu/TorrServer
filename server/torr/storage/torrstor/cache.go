@@ -68,10 +68,22 @@ func NewCache(capacity int64, storage *Storage) *Cache {
 //
 // The ceilings are what keeps that bounded, and they matter because the cost is paid per
 // torrent: several torrents playing at once multiply it.
+//
+// The byte ceiling depends on where the cache lives, because that decides what is being
+// spent. In memory it is the process footprint and has to stay modest; on disk it is space
+// that is plentiful and reclaimed when the torrent is dropped.
 const (
-	maxCapacityReaders = 4
-	maxCapacityBytes   = 512 << 20
+	maxCapacityReaders    = 4
+	maxCapacityBytesInRAM = 512 << 20
+	maxCapacityOnDisk     = 4 << 30
 )
+
+func maxCapacityBytes() int64 {
+	if settings.BTsets != nil && settings.BTsets.UseDisk {
+		return maxCapacityOnDisk
+	}
+	return maxCapacityBytesInRAM
+}
 
 // minConnectionsPerReader is the floor under a viewer's share of the torrent's connection
 // budget.
@@ -106,7 +118,7 @@ func (c *Cache) effectiveCapacity() int64 {
 
 	// Never below the configured size: someone who asked for a cache larger than the
 	// ceiling meant it.
-	return max(base, min(base*readers, maxCapacityBytes))
+	return max(base, min(base*readers, maxCapacityBytes()))
 }
 
 func (c *Cache) Init(info *metainfo.Info, hash metainfo.Hash) {

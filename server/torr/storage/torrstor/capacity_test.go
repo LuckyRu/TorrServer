@@ -6,6 +6,13 @@ import (
 	"server/settings"
 )
 
+func withBTSets(t *testing.T, sets *settings.BTSets) {
+	t.Helper()
+	previous := settings.BTsets
+	settings.BTsets = sets
+	t.Cleanup(func() { settings.BTsets = previous })
+}
+
 func cacheWithReaders(base int64, active int) *Cache {
 	cache := &Cache{readers: make(map[*Reader]struct{})}
 	cache.capacity.Store(base)
@@ -18,6 +25,7 @@ func cacheWithReaders(base int64, active int) *Cache {
 // A reader's window is capacity/readers wide, so a fixed capacity means every new viewer
 // shrinks everybody's buffer. Scaling keeps each viewer's window at the configured size.
 func TestEffectiveCapacityScalesWithViewers(t *testing.T) {
+	withBTSets(t, &settings.BTSets{})
 	const base = 64 << 20
 
 	for _, test := range []struct {
@@ -38,14 +46,16 @@ func TestEffectiveCapacityScalesWithViewers(t *testing.T) {
 }
 
 func TestEffectiveCapacityRespectsCeilings(t *testing.T) {
+	withBTSets(t, &settings.BTSets{})
+
 	// The byte ceiling wins over the reader multiplier.
 	const large = 200 << 20
-	if got := cacheWithReaders(large, 4).effectiveCapacity(); got != maxCapacityBytes {
-		t.Fatalf("effectiveCapacity=%d, want the ceiling %d", got, maxCapacityBytes)
+	if got := cacheWithReaders(large, 4).effectiveCapacity(); got != maxCapacityBytesInRAM {
+		t.Fatalf("effectiveCapacity=%d, want the ceiling %d", got, maxCapacityBytesInRAM)
 	}
 
 	// But it never cuts a cache somebody deliberately configured above it.
-	const huge = maxCapacityBytes * 2
+	const huge = maxCapacityBytesInRAM * 2
 	if got := cacheWithReaders(huge, 4).effectiveCapacity(); got != huge {
 		t.Fatalf("effectiveCapacity=%d, want the configured %d", got, huge)
 	}
@@ -56,12 +66,32 @@ func TestEffectiveCapacityRespectsCeilings(t *testing.T) {
 	}
 }
 
+// The ceiling is about what is being spent, and a disk cache spends something there is a
+// lot more of. Without this the shipped 256 MB default would sit against the memory
+// ceiling and scale barely twice.
+func TestEffectiveCapacityCeilingFollowsTheCacheLocation(t *testing.T) {
+	const base = 256 << 20
+
+	withBTSets(t, &settings.BTSets{})
+	inRAM := cacheWithReaders(base, maxCapacityReaders).effectiveCapacity()
+	if inRAM != maxCapacityBytesInRAM {
+		t.Fatalf("in memory effectiveCapacity=%d, want %d", inRAM, maxCapacityBytesInRAM)
+	}
+
+	withBTSets(t, &settings.BTSets{UseDisk: true})
+	onDisk := cacheWithReaders(base, maxCapacityReaders).effectiveCapacity()
+	if onDisk != base*maxCapacityReaders {
+		t.Fatalf("on disk effectiveCapacity=%d, want the full %d", onDisk, base*maxCapacityReaders)
+	}
+	if onDisk <= inRAM {
+		t.Fatal("a disk cache should be allowed to grow past the memory ceiling")
+	}
+}
+
 // Five viewers on a 25 connection budget get five blocks each, which is not enough to hold
 // a stream. The floor is what keeps a viewer playing when another one appears.
 func TestConnectionsPerReaderHasAFloor(t *testing.T) {
-	previous := settings.BTsets
-	settings.BTsets = &settings.BTSets{ConnectionsLimit: 25}
-	t.Cleanup(func() { settings.BTsets = previous })
+	withBTSets(t, &settings.BTSets{ConnectionsLimit: 25})
 
 	if got := connectionsPerReader(1); got != 25 {
 		t.Fatalf("connectionsPerReader(1)=%d, want the whole budget", got)
