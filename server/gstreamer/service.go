@@ -55,7 +55,7 @@ type Service struct {
 	cueCalls singleflight.Group
 
 	gateMu sync.Mutex
-	gates  map[string]chan struct{}
+	gates  map[string]*torrentGate
 
 	clients clientRegistry
 
@@ -249,11 +249,25 @@ func (s *Service) acquireTorrent(ctx context.Context, hash string) (func(), erro
 
 	gate := s.torrentGate(hash)
 	select {
-	case gate <- struct{}{}:
-		return func() { <-gate }, nil
+	case gate.turn <- struct{}{}:
+		return func() { <-gate.turn }, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+}
+
+// maxUngatedTorrentOps bounds how many operations may run on a torrent without waiting
+// their turn.
+//
+// Giving up after a timeout and going ahead anyway is right for one caller and wrong for
+// several: they all reach the timeout at about the same moment and start together, so the
+// serialisation disappears exactly under the load it exists for. A few ungated slots plus a
+// second wait stagger the starts instead of releasing them in a burst.
+const maxUngatedTorrentOps = 2
+
+type torrentGate struct {
+	turn    chan struct{}
+	ungated chan struct{}
 }
 
 // acquireTorrentWithin is for callers without a request context. It gives up after the
@@ -269,25 +283,41 @@ func (s *Service) acquireTorrentWithin(hash string, timeout time.Duration) func(
 	defer timer.Stop()
 
 	select {
-	case gate <- struct{}{}:
-		return func() { <-gate }
+	case gate.turn <- struct{}{}:
+		return func() { <-gate.turn }
 	case <-timer.C:
+	}
+
+	// The turn did not come. Take one of the few ungated slots, or keep waiting for either
+	// for one more round.
+	timer.Reset(timeout)
+	select {
+	case gate.turn <- struct{}{}:
+		return func() { <-gate.turn }
+	case gate.ungated <- struct{}{}:
+		return func() { <-gate.ungated }
+	case <-timer.C:
+		// Everything is busy and waiting longer would be a worse failure than the
+		// contention it is avoiding.
 		return func() {}
 	}
 }
 
 // Gates are kept for the lifetime of the service: one channel per torrent ever played is
 // negligible, and reclaiming them safely would need reference counting for no real gain.
-func (s *Service) torrentGate(hash string) chan struct{} {
+func (s *Service) torrentGate(hash string) *torrentGate {
 	s.gateMu.Lock()
 	defer s.gateMu.Unlock()
 
 	if s.gates == nil {
-		s.gates = make(map[string]chan struct{})
+		s.gates = make(map[string]*torrentGate)
 	}
 	gate := s.gates[hash]
 	if gate == nil {
-		gate = make(chan struct{}, 1)
+		gate = &torrentGate{
+			turn:    make(chan struct{}, 1),
+			ungated: make(chan struct{}, maxUngatedTorrentOps),
+		}
 		s.gates[hash] = gate
 	}
 	return gate

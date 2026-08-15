@@ -235,6 +235,10 @@ func (t *Torrent) Preload(index int, size int64) {
 			log.TLogln("Preload cancelled")
 			break
 		}
+		if t.preloadYieldsTo(file, size) {
+			log.TLogln("Preload yields to a stream reading elsewhere in the file:", t.Hash().HexString())
+			break
+		}
 
 		n, err := readerStart.Read(tmp)
 		if err != nil {
@@ -290,4 +294,19 @@ func (t *Torrent) findFileIndex(index int) *torrent.File {
 		}
 	}
 	return nil
+}
+
+// preloadYieldsTo reports whether somebody is streaming a part of the torrent this preload
+// is not fetching.
+//
+// Preload warms the head of the file, which is exactly what gst-discoverer reads, so
+// yielding to any reader at all starved the probe of the bytes the preload was fetching for
+// it. A reader positioned past what preload covers is a different matter: it wants other
+// bytes, so the two only compete for the torrent's connections, and the one a viewer is
+// waiting on should win.
+func (t *Torrent) preloadYieldsTo(file *torrent.File, coveredBytes int64) bool {
+	if t.cache == nil || file == nil {
+		return false
+	}
+	return t.cache.HasReaderPast(file.Offset() + coveredBytes)
 }

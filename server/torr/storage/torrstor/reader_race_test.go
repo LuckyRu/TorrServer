@@ -56,3 +56,35 @@ func TestReaderUseFlagIsNotRacedByCacheMaintenance(t *testing.T) {
 	close(stop)
 	wait.Wait()
 }
+
+// The difference between a competitor and a companion is where it is reading. A preload
+// warms the head of a file, which is what a probe reads too — yielding to that starved the
+// probe of the very bytes being fetched for it.
+func TestHasReaderPastSeparatesCompetitorsFromCompanions(t *testing.T) {
+	cache := &Cache{readers: make(map[*Reader]struct{})}
+
+	atHead := &Reader{cache: cache}
+	atHead.isUse.Store(true)
+	atHead.offset.Store(1 << 20)
+	cache.readers[atHead] = struct{}{}
+
+	const covered = 32 << 20
+	if cache.HasReaderPast(covered) {
+		t.Fatal("a reader inside the warmed range wants the same bytes, not other ones")
+	}
+
+	farAway := &Reader{cache: cache}
+	farAway.isUse.Store(true)
+	farAway.offset.Store(covered * 4)
+	cache.readers[farAway] = struct{}{}
+
+	if !cache.HasReaderPast(covered) {
+		t.Fatal("a reader past the warmed range wants other bytes and should be noticed")
+	}
+
+	// An idle reader is nobody waiting.
+	farAway.isUse.Store(false)
+	if cache.HasReaderPast(covered) {
+		t.Fatal("an idle reader must not count as a competitor")
+	}
+}

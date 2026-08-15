@@ -153,6 +153,15 @@ func (r *Reader) getReaderRAHPiece() int {
 	return r.getPieceNum(r.offset.Load() + r.readahead.Load())
 }
 
+// absoluteOffset is this reader's position counted from the start of the torrent rather
+// than of its file, which is the only way positions in different files compare.
+func (r *Reader) absoluteOffset() int64 {
+	if r.file == nil {
+		return r.offset.Load()
+	}
+	return r.file.Offset() + r.offset.Load()
+}
+
 func (r *Reader) getPieceNum(offset int64) int {
 	return int((offset + r.file.Offset()) / r.cache.pieceLength)
 }

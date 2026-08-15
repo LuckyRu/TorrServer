@@ -588,6 +588,8 @@ func codecToCapsName(kind string, values ...string) string {
 			return "audio/x-vorbis"
 		case strings.Contains(codec, "flac"):
 			return "audio/x-flac"
+		case strings.Contains(codec, "dts") || strings.Contains(codec, "dca"):
+			return "audio/x-dts"
 		case strings.Contains(codec, "mpeg") || strings.Contains(codec, "mp3"):
 			return "audio/mpeg"
 		}
