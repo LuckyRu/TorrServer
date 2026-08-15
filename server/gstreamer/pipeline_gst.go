@@ -819,7 +819,10 @@ func (r *gstRunner) reusePipeline(seconds float64, accurate bool, waitTimeout ti
 		gstTaskDebugf(r.task, "seek ASYNC_DONE not observed at %.3fs; validating pipeline state", seconds)
 	}
 
-	waitResult := gstRuntime.elementGetState(r.pipeline, pipelineStateTimeout)
+	waitResult, busErr := r.awaitPreroll(r.pipeline, r.bus)
+	if busErr != nil {
+		return 0, busErr
+	}
 	if waitResult != gstStateChangeSuccess && waitResult != gstStateChangeNoPreroll {
 		if err := gstRuntime.popBusError(r.bus, 0); err != nil {
 			return 0, err
@@ -1388,7 +1391,9 @@ func (r *gstRunner) startPipeline(seconds float64) (float64, error) {
 			cleanup()
 			return 0, fmt.Errorf("gstreamer seek failed: %w", err)
 		}
-		asyncDone, err := gstRuntime.waitForSeekDone(bus, pipelineStateTimeout)
+		// Same budget as reusePipeline's seek: this path is the one taken after the pipeline
+		// died, so the position is at its coldest and the wait is on the swarm, not on a disk.
+		asyncDone, err := gstRuntime.waitForSeekDone(bus, pipelinePrerollTimeout)
 		if err != nil {
 			cleanup()
 			return 0, fmt.Errorf("gstreamer seek did not finish: %w", err)
@@ -1397,7 +1402,11 @@ func (r *gstRunner) startPipeline(seconds float64) (float64, error) {
 			gstTaskDebugf(r.task, "initial seek ASYNC_DONE not observed at %.3fs; validating pipeline state", seconds)
 		}
 
-		waitResult := gstRuntime.elementGetState(pipeline, pipelineStateTimeout)
+		waitResult, busErr := r.awaitPreroll(pipeline, bus)
+		if busErr != nil {
+			cleanup()
+			return 0, busErr
+		}
 		switch waitResult {
 		case gstStateChangeSuccess, gstStateChangeNoPreroll:
 		case gstStateChangeAsync:
