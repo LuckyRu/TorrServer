@@ -21,7 +21,7 @@ func (t *Torrent) Preload(index int, size int64) {
 	if size <= 0 {
 		return
 	}
-	t.PreloadSize = size
+	t.setPreloadSize(size)
 
 	if t.Stat() == state.TorrentGettingInfo {
 		if !t.WaitInfo() {
@@ -46,9 +46,8 @@ func (t *Torrent) Preload(index int, size int64) {
 			t.setStat(state.TorrentWorking)
 		}
 		t.muTorrent.Unlock()
-		// Очистка по окончании прелоада
-		t.BitRate = ""
-		t.DurationSeconds = 0
+		// Очистка по окончании прелоада.
+		t.setMediaInfo("", 0)
 	}()
 
 	file := t.findFileIndex(index)
@@ -110,8 +109,7 @@ func (t *Torrent) Preload(index int, size int64) {
 			link = "https://127.0.0.1:" + settings.SslPort + "/play/" + t.Hash().HexString() + "/" + strconv.Itoa(index)
 		}
 		if data, err := ffprobe.ProbeUrl(link); err == nil {
-			t.BitRate = data.Format.BitRate
-			t.DurationSeconds = data.Format.DurationSeconds
+			t.setMediaInfo(data.Format.BitRate, data.Format.DurationSeconds)
 		}
 	}
 
