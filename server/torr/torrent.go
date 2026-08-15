@@ -44,6 +44,7 @@ type Torrent struct {
 	bt    *BTServer
 	cache *torrstor.Cache
 
+	progressBusy        atomic.Bool
 	lastTimeSpeed       time.Time
 	DownloadSpeed       float64
 	UploadSpeed         float64
@@ -56,7 +57,10 @@ type Torrent struct {
 	DurationSeconds float64
 	BitRate         string
 
-	expiredTime time.Time
+	// expiredTime is unix nanos, not a time.Time: it is read-modify-written from the HTTP path
+	// on every request and read from the progress goroutine, and a torn read of a three-word
+	// value closes a torrent somebody is watching.
+	expiredTime atomic.Int64
 
 	closed <-chan struct{}
 
@@ -157,10 +161,19 @@ func (t *Torrent) GotInfo() bool {
 	}
 }
 
+// AddExpiredTime pushes the expiry out, never pulls it in. The compare-and-swap is what makes
+// that true for concurrent callers: a plain read-modify-write loses one caller's extension and
+// the torrent closes while somebody is still watching it.
 func (t *Torrent) AddExpiredTime(duration time.Duration) {
-	newExpiredTime := time.Now().Add(duration)
-	if t.expiredTime.Before(newExpiredTime) {
-		t.expiredTime = newExpiredTime
+	candidate := time.Now().Add(duration).UnixNano()
+	for {
+		current := t.expiredTime.Load()
+		if current >= candidate {
+			return
+		}
+		if t.expiredTime.CompareAndSwap(current, candidate) {
+			return
+		}
 	}
 }
 
@@ -171,7 +184,15 @@ func (t *Torrent) watch() {
 	for {
 		select {
 		case <-t.progressTicker.C:
-			go t.progressEvent()
+			// One at a time: progressEvent walks every piece of the cache through GetState,
+			// which at a household cache size is hundreds of them. Ticks that overlap divide
+			// the byte deltas by a near-zero interval and report speeds in terabytes.
+			if t.progressBusy.CompareAndSwap(false, true) {
+				go func() {
+					defer t.progressBusy.Store(false)
+					t.progressEvent()
+				}()
+			}
 		case <-t.closed:
 			return
 		}
@@ -207,9 +228,11 @@ func (t *Torrent) progressEvent() {
 		t.DownloadSpeed = 0
 		t.UploadSpeed = 0
 	}
+	// Under the same lock that read it: the interval is the denominator of both speeds, so a
+	// write outside the lock is both a data race and a source of nonsense numbers.
+	t.lastTimeSpeed = time.Now()
 	t.muTorrent.Unlock()
 
-	t.lastTimeSpeed = time.Now()
 	t.updateRA()
 }
 
@@ -235,7 +258,7 @@ func (t *Torrent) expired() bool {
 	if t.cache == nil {
 		return false
 	}
-	return t.cache.Readers() == 0 && t.expiredTime.Before(time.Now()) && (t.Stat() == state.TorrentWorking || t.Stat() == state.TorrentClosed)
+	return t.cache.Readers() == 0 && t.expiredTime.Load() < time.Now().UnixNano() && (t.Stat() == state.TorrentWorking || t.Stat() == state.TorrentClosed)
 }
 
 func (t *Torrent) Files() []*torrent.File {
@@ -322,6 +345,22 @@ func (t *Torrent) Close() bool {
 
 	t.drop()
 	return true
+}
+
+// setPreloadSize, setMediaInfo and clearMediaInfo exist so the fields Status() reads under
+// muTorrent are only ever written under it too. Preload used to write them bare, which is the
+// same defect as two different locks: Status() runs on every viewer's heartbeat.
+func (t *Torrent) setPreloadSize(size int64) {
+	t.muTorrent.Lock()
+	t.PreloadSize = size
+	t.muTorrent.Unlock()
+}
+
+func (t *Torrent) setMediaInfo(bitRate string, durationSeconds float64) {
+	t.muTorrent.Lock()
+	t.BitRate = bitRate
+	t.DurationSeconds = durationSeconds
+	t.muTorrent.Unlock()
 }
 
 func (t *Torrent) Status() *state.TorrentStatus {
