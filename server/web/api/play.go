@@ -53,7 +53,7 @@ func play(c *gin.Context) {
 		return
 	}
 
-	if tor.Stat == state.TorrentInDB {
+	if tor.Stat() == state.TorrentInDB {
 		tor, err = torr.AddTorrent(spec, tor.Title, tor.Poster, tor.Data, tor.Category)
 		if err != nil {
 			c.AbortWithError(http.StatusInternalServerError, err)

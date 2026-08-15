@@ -41,7 +41,7 @@ func Preconfig(kill bool) {
 				{
 					systemRequired := false
 					for _, torrent := range torr.ListTorrent() {
-						if torrent.Stat != state.TorrentInDB {
+						if torrent.Stat() != state.TorrentInDB {
 							systemRequired = true
 							break
 						}

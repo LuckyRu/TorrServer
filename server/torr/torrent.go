@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"server/torrshash"
@@ -29,7 +30,11 @@ type Torrent struct {
 	Data     string
 	*torrent.TorrentSpec
 
-	Stat      state.TorrentStat
+	// stat is read by the disconnect sweep and by every status request while the torrent
+	// itself moves through its lifecycle. muTorrent guards some of those transitions and not
+	// others, so the field carries its own synchronisation and the mutex keeps ordering the
+	// work around it.
+	stat      atomic.Int32
 	Timestamp int64
 	Size      int64
 
@@ -95,7 +100,7 @@ func NewTorrent(spec *torrent.TorrentSpec, bt *BTServer) (*Torrent, error) {
 
 	torr := new(Torrent)
 	torr.Torrent = goTorrent
-	torr.Stat = state.TorrentAdded
+	torr.setStat(state.TorrentAdded)
 	torr.lastTimeSpeed = time.Now()
 	torr.bt = bt
 	torr.closed = goTorrent.Closed()
@@ -133,17 +138,17 @@ func (t *Torrent) WaitInfo() bool {
 
 func (t *Torrent) GotInfo() bool {
 	// log.TLogln("GotInfo state:", t.Stat)
-	if t == nil || t.Stat == state.TorrentClosed {
+	if t == nil || t.Stat() == state.TorrentClosed {
 		return false
 	}
 	// assume we have info in preload state
 	// and dont override with TorrentWorking
-	if t.Stat == state.TorrentPreload {
+	if t.Stat() == state.TorrentPreload {
 		return true
 	}
-	t.Stat = state.TorrentGettingInfo
+	t.setStat(state.TorrentGettingInfo)
 	if t.WaitInfo() {
-		t.Stat = state.TorrentWorking
+		t.setStat(state.TorrentWorking)
 		t.AddExpiredTime(time.Second * time.Duration(settings.BTsets.TorrentDisconnectTimeout))
 		return true
 	} else {
@@ -230,7 +235,7 @@ func (t *Torrent) expired() bool {
 	if t.cache == nil {
 		return false
 	}
-	return t.cache.Readers() == 0 && t.expiredTime.Before(time.Now()) && (t.Stat == state.TorrentWorking || t.Stat == state.TorrentClosed)
+	return t.cache.Readers() == 0 && t.expiredTime.Before(time.Now()) && (t.Stat() == state.TorrentWorking || t.Stat() == state.TorrentClosed)
 }
 
 func (t *Torrent) Files() []*torrent.File {
@@ -251,6 +256,14 @@ func (t *Torrent) Hash() metainfo.Hash {
 	return [20]byte{}
 }
 
+func (t *Torrent) Stat() state.TorrentStat {
+	return state.TorrentStat(t.stat.Load())
+}
+
+func (t *Torrent) setStat(stat state.TorrentStat) {
+	t.stat.Store(int32(stat))
+}
+
 func (t *Torrent) Length() int64 {
 	if t.Info() == nil {
 		return 0
@@ -263,7 +276,7 @@ func (t *Torrent) Length() int64 {
 var ErrTorrentClosed = errors.New("torrent is closed")
 
 func (t *Torrent) NewReader(file *torrent.File) (*torrstor.Reader, error) {
-	if t.Stat == state.TorrentClosed {
+	if t.Stat() == state.TorrentClosed {
 		return nil, ErrTorrentClosed
 	}
 	return t.cache.NewReader(file)
@@ -291,13 +304,13 @@ func (t *Torrent) Close() bool {
 	if t == nil {
 		return false
 	}
-	if t.Stat == state.TorrentClosed {
+	if t.Stat() == state.TorrentClosed {
 		return true
 	}
 	if settings.ReadOnly && t.cache != nil && t.cache.GetUseReaders() > 0 {
 		return false
 	}
-	t.Stat = state.TorrentClosed
+	t.setStat(state.TorrentClosed)
 
 	if t.bt != nil {
 		t.bt.mu.Lock()
@@ -317,8 +330,9 @@ func (t *Torrent) Status() *state.TorrentStatus {
 
 	st := new(state.TorrentStatus)
 
-	st.Stat = t.Stat
-	st.StatString = t.Stat.String()
+	stat := t.Stat()
+	st.Stat = stat
+	st.StatString = stat.String()
 	st.Title = t.Title
 	st.Category = t.Category
 	st.Poster = t.Poster

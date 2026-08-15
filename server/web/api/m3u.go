@@ -104,7 +104,7 @@ func playList(c *gin.Context) {
 		return
 	}
 
-	if tor.Stat == state.TorrentInDB {
+	if tor.Stat() == state.TorrentInDB {
 		tor = torr.LoadTorrent(tor)
 		if tor == nil {
 			c.AbortWithError(http.StatusInternalServerError, errors.New("error get torrent info"))

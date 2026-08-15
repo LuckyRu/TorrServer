@@ -1,19 +1,27 @@
 package torrstor
 
 import (
+	"sync/atomic"
+	"time"
+
 	"github.com/anacrolix/torrent"
 	"github.com/anacrolix/torrent/storage"
 	"server/settings"
 )
 
+// Size, Complete and Accessed are written by the torrent download path and read by the
+// eviction sweep and by GetState, which every client's heartbeat calls. Those run on
+// different goroutines with no lock between them - the per-piece mutex covers the buffer,
+// not this bookkeeping - so the fields carry their own synchronisation.
+//
+// They are not serialised anywhere; GetState copies them into state.ItemState by hand.
 type Piece struct {
 	storage.PieceImpl `json:"-"`
 
-	Id   int   `json:"-"`
-	Size int64 `json:"size"`
-
-	Complete bool  `json:"complete"`
-	Accessed int64 `json:"accessed"`
+	Id       int `json:"-"`
+	Size     atomic.Int64
+	Complete atomic.Bool
+	Accessed atomic.Int64
 
 	mPiece *MemPiece  `json:"-"`
 	dPiece *DiskPiece `json:"-"`
@@ -52,20 +60,33 @@ func (p *Piece) ReadAt(b []byte, off int64) (n int, err error) {
 }
 
 func (p *Piece) MarkComplete() error {
-	p.Complete = true
+	p.Complete.Store(true)
 	return nil
 }
 
 func (p *Piece) MarkNotComplete() error {
-	p.Complete = false
+	p.Complete.Store(false)
 	return nil
 }
 
 func (p *Piece) Completion() storage.Completion {
 	return storage.Completion{
-		Complete: p.Complete,
+		Complete: p.Complete.Load(),
 		Ok:       true,
 	}
+}
+
+// noteWrite records n freshly written bytes, clamped to one piece.
+func (p *Piece) noteWrite(n int) {
+	if size := p.Size.Add(int64(n)); size > p.cache.pieceLength {
+		p.Size.Store(p.cache.pieceLength)
+	}
+	p.Accessed.Store(time.Now().Unix())
+}
+
+func (p *Piece) noteRelease() {
+	p.Size.Store(0)
+	p.Complete.Store(false)
 }
 
 func (p *Piece) Release() {
