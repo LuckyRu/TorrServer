@@ -479,6 +479,22 @@ func (c *Cache) GetUseReaders() int {
 	return readers
 }
 
+// HasReaderPast reports whether an active reader is streaming past the given offset,
+// counted from the start of the torrent rather than of one file.
+//
+// It answers "is somebody reading bytes I am not fetching", which is what separates a
+// competitor from a companion. A reader sitting at the head of the same file wants exactly
+// what a preload is warming; one positioned past it wants something else, and the two only
+// share connections.
+func (c *Cache) HasReaderPast(offset int64) bool {
+	for _, r := range c.readersSnapshot() {
+		if r.isUse.Load() && r.absoluteOffset() > offset {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *Cache) Readers() int {
 	if c == nil {
 		return 0
