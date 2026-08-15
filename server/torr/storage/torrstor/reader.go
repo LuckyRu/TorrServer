@@ -30,6 +30,14 @@ type Reader struct {
 	cache    *Cache
 	isClosed atomic.Bool
 
+	// inFlight counts the reads and seeks currently inside the underlying reader. The idle
+	// sweep parks an unused reader at byte 0 to release its piece claims; doing that under a
+	// read in progress returns the head of the file to a caller that asked for its position,
+	// and a demuxer then parses the file header as mid-stream data. A read blocked on the
+	// swarm is exactly the case that matters: waiting for bytes is what makes a busy reader
+	// look idle. Registered under mu so readerOff and a starting read cannot overlap.
+	inFlight atomic.Int32
+
 	///Preload
 	lastAccess atomic.Int64
 	mu         sync.Mutex
@@ -70,7 +78,8 @@ func (r *Reader) Seek(offset int64, whence int) (n int64, err error) {
 	case io.SeekEnd:
 		r.offset.Store(r.file.Length() + offset)
 	}
-	r.readerOn()
+	r.beginIO()
+	defer r.endIO()
 	n, err = r.Reader.Seek(offset, whence)
 	r.offset.Store(n)
 	r.lastAccess.Store(time.Now().Unix())
@@ -83,7 +92,8 @@ func (r *Reader) Read(p []byte) (n int, err error) {
 		return
 	}
 	if r.file.HasInfo() {
-		r.readerOn()
+		r.beginIO()
+		defer r.endIO()
 		n, err = r.Reader.Read(p)
 
 		// samsung tv fix xvid/divx
@@ -200,9 +210,28 @@ func (r *Reader) checkReader() {
 	}
 }
 
+// beginIO claims the reader for one read or seek and undoes any parking the sweep did.
+// Claiming under mu is what makes it exclusive with readerOff: once readerOff holds mu and
+// has found nothing in flight, no read can start before it is finished.
+func (r *Reader) beginIO() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.inFlight.Add(1)
+	r.resume()
+}
+
+func (r *Reader) endIO() {
+	r.inFlight.Add(-1)
+}
+
 func (r *Reader) readerOn() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.resume()
+}
+
+// resume must be called with mu held.
+func (r *Reader) resume() {
 	if !r.isUse.Load() {
 		if pos, err := r.Reader.Seek(0, io.SeekCurrent); err == nil && pos == 0 {
 			r.Reader.Seek(r.offset.Load(), io.SeekStart)
@@ -215,6 +244,12 @@ func (r *Reader) readerOn() {
 func (r *Reader) readerOff() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	// A reader serving a request is not idle, whatever its last-access stamp says — the
+	// stamp is only written once the read returns, so one blocked on the swarm looks
+	// abandoned. Parking it here is what corrupts that read.
+	if r.inFlight.Load() > 0 {
+		return
+	}
 	if r.isUse.Load() {
 		r.SetReadahead(0)
 		r.isUse.Store(false)

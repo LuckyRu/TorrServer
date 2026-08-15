@@ -102,11 +102,19 @@ func (t *Torrent) Stream(fileID int, req *http.Request, resp http.ResponseWriter
 	host, port, clerr := net.SplitHostPort(req.RemoteAddr)
 
 	if sets.BTsets.EnableDebug {
+		// The requested byte range is the only thing that distinguishes one of a demuxer's
+		// many pull requests from the next. Without it a "file might be corrupt" error names
+		// a position in seconds and nothing that can be matched against what was served.
+		byteRange := req.Header.Get("Range")
+		if byteRange == "" {
+			byteRange = "full"
+		}
 		if clerr != nil {
-			log.Printf("[Stream:%d] Connect client (Active streams: %d)", streamID, atomic.LoadInt32(&activeStreams))
+			log.Printf("[Stream:%d] Connect client file=%d range=%s (Active streams: %d)",
+				streamID, fileID, byteRange, atomic.LoadInt32(&activeStreams))
 		} else {
-			log.Printf("[Stream:%d] Connect client %s:%s (Active streams: %d)",
-				streamID, host, port, atomic.LoadInt32(&activeStreams))
+			log.Printf("[Stream:%d] Connect client %s:%s file=%d range=%s (Active streams: %d)",
+				streamID, host, port, fileID, byteRange, atomic.LoadInt32(&activeStreams))
 		}
 	}
 
