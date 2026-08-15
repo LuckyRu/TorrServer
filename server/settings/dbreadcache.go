@@ -1,6 +1,7 @@
 package settings
 
 import (
+	"slices"
 	"sync"
 
 	"server/log"
@@ -88,6 +89,9 @@ func (v *DBReadCache) Set(xPath, name string, value []byte) {
 	v.db.Set(xPath, name, value)
 }
 
+// List returns a copy. The cached slice is shared by every caller, so handing out its backing
+// array lets one caller's sort or filter rewrite what the next one reads — under a read lock,
+// where nothing is watching for it.
 func (v *DBReadCache) List(xPath string) []string {
 	if v.listCache == nil {
 		return nil
@@ -96,7 +100,7 @@ func (v *DBReadCache) List(xPath string) []string {
 	v.listCacheMutex.RLock()
 	if names, ok := v.listCache[xPath]; ok {
 		defer v.listCacheMutex.RUnlock()
-		return names
+		return slices.Clone(names)
 	}
 	v.listCacheMutex.RUnlock()
 
@@ -113,7 +117,7 @@ func (v *DBReadCache) List(xPath string) []string {
 	}
 	v.listCacheMutex.Unlock()
 
-	return names
+	return slices.Clone(names)
 }
 
 func (v *DBReadCache) Rem(xPath, name string) {

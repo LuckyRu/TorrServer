@@ -47,7 +47,10 @@ type Cache struct {
 	isClosed atomic.Bool
 	muRemove sync.Mutex
 	muSweep  sync.Mutex
-	torrent  *torrent.Torrent
+	// torrent is behind an interface so the eviction pass can be reached from a test; see
+	// source.go. N4: it is written once by SetTorrent and read by background goroutines.
+	torrent   torrentPieces
+	muTorrent sync.RWMutex
 }
 
 func NewCache(capacity int64, storage *Storage) *Cache {
@@ -94,7 +97,8 @@ func maxCapacityBytes() int64 {
 // An even split starves everybody once there are a few viewers: at the default limit of 25
 // a fifth viewer leaves each of them five concurrent blocks, which is not enough to hold a
 // stream. The floor means the total may exceed ConnectionsLimit — that is deliberate, and
-// EstablishedConnsPerTorrent should be raised to match in a house with several viewers.
+// MaxConnectionsNeeded is what the client has to be configured with for the floor to mean
+// anything at all.
 const minConnectionsPerReader = 8
 
 func connectionsPerReader(activeReaders int) int {
@@ -102,6 +106,15 @@ func connectionsPerReader(activeReaders int) int {
 		activeReaders = 1
 	}
 	return max(minConnectionsPerReader, settings.BTsets.ConnectionsLimit/activeReaders)
+}
+
+// MaxConnectionsNeeded is the most the readers of one torrent can ask for together.
+//
+// The floor is a promise to a viewer, and a promise the torrent client never heard about is
+// not a promise: EstablishedConnsPerTorrent is set once at startup, so a budget below this
+// caps the floor silently at the exact moment a household is watching together.
+func MaxConnectionsNeeded() int {
+	return minConnectionsPerReader * maxReadersPerTorrent
 }
 
 // effectiveCapacity is the cache size for the number of viewers there are right now.
@@ -148,7 +161,25 @@ func (c *Cache) Init(info *metainfo.Info, hash metainfo.Hash) {
 }
 
 func (c *Cache) SetTorrent(torr *torrent.Torrent) {
-	c.torrent = torr
+	if torr == nil {
+		return
+	}
+	c.setPieceSource(anacrolixTorrent{inner: torr})
+}
+
+// setPieceSource is written once at torrent setup and read by every background pass, so it
+// carries its own synchronisation: an interface value is two words, and a torn read of one
+// crashes the sweep rather than merely confusing it.
+func (c *Cache) setPieceSource(source torrentPieces) {
+	c.muTorrent.Lock()
+	c.torrent = source
+	c.muTorrent.Unlock()
+}
+
+func (c *Cache) pieceSource() torrentPieces {
+	c.muTorrent.RLock()
+	defer c.muTorrent.RUnlock()
+	return c.torrent
 }
 
 func (c *Cache) getPieces() map[int]*Piece {
@@ -175,8 +206,8 @@ func (c *Cache) Piece(m metainfo.Piece) storage.PieceImpl {
 }
 
 func (c *Cache) Close() error {
-	if c.torrent != nil {
-		log.TLogln("Close cache for:", c.torrent.Name(), c.hash)
+	if source := c.pieceSource(); source != nil {
+		log.TLogln("Close cache for:", source.Name(), c.hash)
 	} else {
 		log.TLogln("Close cache for:", c.hash)
 	}
@@ -229,19 +260,23 @@ func (c *Cache) AdjustRA(readahead int64) {
 func (c *Cache) GetState() *state.CacheState {
 	cState := new(state.CacheState)
 
+	source := c.pieceSource()
 	piecesState := make(map[int]state.ItemState, 0)
 	var fill int64 = 0
 
 	for _, p := range c.getPieces() {
 		if size := p.Size.Load(); size > 0 {
 			fill += size
-			piecesState[p.Id] = state.ItemState{
+			item := state.ItemState{
 				Id:        p.Id,
 				Size:      size,
 				Length:    c.pieceLength,
 				Completed: p.Complete.Load(),
-				Priority:  int(c.torrent.PieceState(p.Id).Priority),
 			}
+			if source != nil {
+				item.Priority = int(source.PriorityAt(p.Id))
+			}
+			piecesState[p.Id] = item
 		}
 	}
 
@@ -361,9 +396,10 @@ func (c *Cache) getRemPieces() []*Piece {
 }
 
 func (c *Cache) setLoadPriority(ranges []Range) {
+	source := c.pieceSource()
 	readers := c.readersSnapshot()
 	pieces := c.getPieces()
-	if len(readers) == 0 || pieces == nil {
+	if source == nil || len(readers) == 0 || pieces == nil {
 		return
 	}
 	// Split the budget between viewers, not between readers: a reader that has gone idle
@@ -391,15 +427,15 @@ func (c *Cache) setLoadPriority(ranges []Range) {
 		for i := readerPos; i < end && limit < count; i++ {
 			if !pieces[i].Complete.Load() {
 				if i == readerPos {
-					c.torrent.Piece(i).SetPriority(torrent.PiecePriorityNow)
+					source.SetPriorityAt(i, PriorityNow)
 				} else if i == readerPos+1 {
-					c.torrent.Piece(i).SetPriority(torrent.PiecePriorityNext)
+					source.SetPriorityAt(i, PriorityNext)
 				} else if i > readerPos && i <= readerRAHPos {
-					c.torrent.Piece(i).SetPriority(torrent.PiecePriorityReadahead)
-				} else if i > readerRAHPos && i <= readerRAHPos+5 && c.torrent.PieceState(i).Priority != torrent.PiecePriorityHigh {
-					c.torrent.Piece(i).SetPriority(torrent.PiecePriorityHigh)
-				} else if i > readerRAHPos+5 && c.torrent.PieceState(i).Priority != torrent.PiecePriorityNormal {
-					c.torrent.Piece(i).SetPriority(torrent.PiecePriorityNormal)
+					source.SetPriorityAt(i, PriorityReadahead)
+				} else if i > readerRAHPos && i <= readerRAHPos+5 && source.PriorityAt(i) != PriorityHigh {
+					source.SetPriorityAt(i, PriorityHigh)
+				} else if i > readerRAHPos+5 && source.PriorityAt(i) != PriorityNormal {
+					source.SetPriorityAt(i, PriorityNormal)
 				}
 				limit++
 			}
@@ -446,6 +482,10 @@ func (c *Cache) isIdInFileBE(ranges []Range, id int) bool {
 const maxReadersPerTorrent = 12
 
 func (c *Cache) NewReader(file *torrent.File) (*Reader, error) {
+	return c.newReaderFrom(anacrolixFile{inner: file})
+}
+
+func (c *Cache) newReaderFrom(file readerFile) (*Reader, error) {
 	return newReader(file, c)
 }
 
@@ -510,14 +550,21 @@ func (c *Cache) CloseReader(r *Reader) {
 	r.cache.muReaders.Unlock()
 	// Reader.Close touches anacrolix internals, keep it outside muReaders
 	r.Close()
-	go c.clearPriority()
+	go func() {
+		// Let the closing reader settle before dropping priorities: its slot in the map is
+		// already gone, but requests it issued may still be in flight. The wait belongs to
+		// this caller alone — getRemPieces calls clearPriority synchronously while holding
+		// muSweep, and a second of sleep there put every other sweep of the torrent behind it.
+		time.Sleep(time.Second)
+		c.clearPriority()
+	}()
 }
 
 func (c *Cache) clearPriority() {
-	if c.torrent == nil {
+	source := c.pieceSource()
+	if source == nil {
 		return
 	}
-	time.Sleep(time.Second)
 	ranges := make([]Range, 0)
 	for _, r := range c.readersSnapshot() {
 		r.checkReader()
@@ -530,13 +577,13 @@ func (c *Cache) clearPriority() {
 	for id := range c.getPieces() {
 		if len(ranges) > 0 {
 			if !inRanges(ranges, id) {
-				if c.torrent.PieceState(id).Priority != torrent.PiecePriorityNone {
-					c.torrent.Piece(id).SetPriority(torrent.PiecePriorityNone)
+				if source.PriorityAt(id) != PriorityNone {
+					source.SetPriorityAt(id, PriorityNone)
 				}
 			}
 		} else {
-			if c.torrent.PieceState(id).Priority != torrent.PiecePriorityNone {
-				c.torrent.Piece(id).SetPriority(torrent.PiecePriorityNone)
+			if source.PriorityAt(id) != PriorityNone {
+				source.SetPriorityAt(id, PriorityNone)
 			}
 		}
 	}
