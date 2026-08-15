@@ -78,6 +78,9 @@ const (
 	// How long an operation waits for the torrent gate before going ahead regardless.
 	probeGateWait    = 20 * time.Second
 	pipelineGateWait = 15 * time.Second
+	cueGateWait      = 15 * time.Second
+	// cueReadBudget bounds the shared cue read, which no single caller may cancel.
+	cueReadBudget = 30 * time.Second
 )
 
 type probeCacheEntry struct {
@@ -448,6 +451,10 @@ func (s *Service) Probe(hash string, fileID string) (ProbeInfo, error) {
 	return probe, nil
 }
 
+// readCueTimeline is a seam: the shared cue read is what a test needs to hold still while it
+// checks that one caller going away does not fail the others.
+var readCueTimeline = readMatroskaCueTimeline
+
 // cueTimeline reads the Matroska cue index, or returns the cached one.
 //
 // The read costs HTTP range requests against the torrent and used to run uncancellable
@@ -466,16 +473,20 @@ func (s *Service) cueTimeline(ctx context.Context, conf Config, hash string, fil
 		if cue, ok := s.getCachedCue(key); ok {
 			return cue, nil
 		}
-		release, err := s.acquireTorrent(ctx, hash)
-		if err != nil {
-			return nil, err
-		}
-		cue := readMatroskaCueTimeline(ctx, sourceURL, probe.FileSize, probe.DurationNS)
+		// Deliberately not the caller's context. The work is shared through singleflight, so
+		// honouring one caller's cancellation fails everyone who joined it — and a player
+		// cancels requests as a matter of course. The budget bounds it instead, and the
+		// result is cached, so nothing is wasted if the first caller does go away.
+		shared, cancel := context.WithTimeout(context.WithoutCancel(ctx), cueReadBudget)
+		defer cancel()
+
+		release := s.acquireTorrentWithin(hash, cueGateWait)
+		cue := readCueTimeline(shared, sourceURL, probe.FileSize, probe.DurationNS)
 		release()
-		if cue == nil && ctx.Err() != nil {
-			// Cancelled, not absent: caching this would deny the next caller a cue
+		if cue == nil && shared.Err() != nil {
+			// Timed out, not absent: caching this would deny the next caller a cue
 			// timeline it could have had.
-			return nil, ctx.Err()
+			return nil, shared.Err()
 		}
 		s.setCachedCue(key, cue)
 		return cue, nil
