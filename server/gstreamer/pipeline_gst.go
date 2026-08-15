@@ -726,7 +726,9 @@ func (r *gstRunner) Seek(seconds float64) bool {
 	var actualSeconds float64
 	var err error
 	if reuse {
-		actualSeconds, err = r.reusePipeline(seconds, accurate, pipelineStateTimeout)
+		// A seek into a part of the file nothing has downloaded has to wait for the torrent
+		// to fetch it, so it gets the same budget as a preroll rather than a local-file one.
+		actualSeconds, err = r.reusePipeline(seconds, accurate, pipelinePrerollTimeout)
 	} else {
 		r.reader.SeekReset(seconds)
 		actualSeconds, err = r.startPipeline(seconds)
@@ -823,6 +825,15 @@ func (r *gstRunner) reusePipeline(seconds float64, accurate bool, waitTimeout ti
 			return 0, err
 		}
 		return 0, fmt.Errorf("gstreamer seek state=%d while reusing pipeline", waitResult)
+	}
+
+	// A seek that ended up past the end of the stream settles into EOS rather than failing
+	// outright, and the state above is perfectly healthy by then. Claiming the seek worked
+	// and restarting the bus watch hands that EOS to the watch, which reports a broken
+	// stream a moment after we called the seek good. It is this seek's failure, so the
+	// caller can do what it does for any failed seek and rebuild the pipeline.
+	if gstRuntime.popBusMessage(r.bus, 0, gstMessageEOS) {
+		return 0, errors.New("gstreamer reached EOS while completing seek")
 	}
 
 	actualSeconds := r.querySeekPosition(r.pipeline, seconds)
