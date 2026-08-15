@@ -433,3 +433,39 @@ func TestCachedProbeIsRevalidatedAfterConfigChange(t *testing.T) {
 		t.Fatalf("Probe error=%v, want AVI requires TranscodeAVI", err)
 	}
 }
+
+// Going ahead after a timeout is right for one caller and wrong for several: they reach the
+// timeout together and start together, so the serialisation vanishes under the very load it
+// exists for. A few ungated slots come free immediately; past those the wait is longer, and
+// that stagger is the point.
+func TestTorrentGateDegradesInStages(t *testing.T) {
+	service := &Service{conf: Config{}.normalized()}
+
+	held, err := service.acquireTorrent(context.Background(), "hash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held()
+
+	const wait = 40 * time.Millisecond
+	releases := make([]func(), 0, maxUngatedTorrentOps)
+	for i := range maxUngatedTorrentOps {
+		start := time.Now()
+		release := service.acquireTorrentWithin("hash", wait)
+		if elapsed := time.Since(start); elapsed > 3*wait {
+			t.Fatalf("ungated slot %d took %v, want it granted after one wait", i, elapsed)
+		}
+		releases = append(releases, release)
+	}
+
+	// Everything is taken, so this one waits both stages before going ahead regardless.
+	start := time.Now()
+	service.acquireTorrentWithin("hash", wait)()
+	if elapsed := time.Since(start); elapsed < 2*wait {
+		t.Fatalf("past the ungated slots the wait was %v, want at least both stages %v", elapsed, 2*wait)
+	}
+
+	for _, release := range releases {
+		release()
+	}
+}
