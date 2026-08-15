@@ -17,7 +17,9 @@ func cacheWithReaders(base int64, active int) *Cache {
 	cache := &Cache{readers: make(map[*Reader]struct{})}
 	cache.capacity.Store(base)
 	for range active {
-		cache.readers[&Reader{cache: cache, isUse: true}] = struct{}{}
+		r := &Reader{cache: cache}
+		r.isUse.Store(true)
+		cache.readers[r] = struct{}{}
 	}
 	return cache
 }

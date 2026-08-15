@@ -26,8 +26,10 @@ type Cache struct {
 	// capacity is the configured size for a single viewer; effectiveCapacity scales it.
 	// Atomic because Init and AdjustRA write it while the eviction sweep reads it.
 	capacity atomic.Int64
-	filled   int64
-	hash     metainfo.Hash
+	// filled is recomputed by every heartbeat through GetState and by the eviction sweep,
+	// and those run concurrently once a torrent feeds more than one stream.
+	filled atomic.Int64
+	hash   metainfo.Hash
 
 	pieceLength int64
 	pieceCount  int
@@ -49,7 +51,7 @@ type Cache struct {
 
 func NewCache(capacity int64, storage *Storage) *Cache {
 	ret := &Cache{
-		filled:  0,
+
 		pieces:  make(map[int]*Piece),
 		storage: storage,
 		readers: make(map[*Reader]struct{}),
@@ -254,7 +256,7 @@ func (c *Cache) GetState() *state.CacheState {
 		})
 	}
 
-	c.filled = fill
+	c.filled.Store(fill)
 	cState.Capacity = c.effectiveCapacity()
 	cState.PiecesLength = c.pieceLength
 	cState.PiecesCount = c.pieceCount
@@ -281,8 +283,8 @@ func (c *Cache) cleanPieces() {
 
 	remPieces := c.getRemPieces()
 	capacity := c.effectiveCapacity()
-	if c.filled > capacity {
-		rems := (c.filled-capacity)/c.pieceLength + 1
+	if filled := c.filled.Load(); filled > capacity {
+		rems := (filled-capacity)/c.pieceLength + 1
 		for _, p := range remPieces {
 			c.removePiece(p)
 			rems--
@@ -301,7 +303,7 @@ func (c *Cache) getRemPieces() []*Piece {
 	ranges := make([]Range, 0)
 	for _, r := range readers {
 		r.checkReader()
-		if r.isUse {
+		if r.isUse.Load() {
 			ranges = append(ranges, r.getPiecesRange())
 		}
 	}
@@ -337,7 +339,7 @@ func (c *Cache) getRemPieces() []*Piece {
 		return piecesRemove[i].Accessed < piecesRemove[j].Accessed
 	})
 
-	c.filled = fill
+	c.filled.Store(fill)
 	return piecesRemove
 }
 
@@ -352,14 +354,14 @@ func (c *Cache) setLoadPriority(ranges []Range) {
 	// is actually watching.
 	active := 0
 	for _, r := range readers {
-		if r.isUse {
+		if r.isUse.Load() {
 			active++
 		}
 	}
 	count := connectionsPerReader(active) // max concurrent loading blocks
 
 	for _, r := range readers {
-		if !r.isUse {
+		if !r.isUse.Load() {
 			continue
 		}
 		if c.isIdInFileBE(ranges, r.getReaderPiece()) {
@@ -453,7 +455,7 @@ func (c *Cache) GetUseReaders() int {
 	defer c.muReaders.RUnlock()
 	readers := 0
 	for reader := range c.readers {
-		if reader.isUse {
+		if reader.isUse.Load() {
 			readers++
 		}
 	}
@@ -486,7 +488,7 @@ func (c *Cache) clearPriority() {
 	ranges := make([]Range, 0)
 	for _, r := range c.readersSnapshot() {
 		r.checkReader()
-		if r.isUse {
+		if r.isUse.Load() {
 			ranges = append(ranges, r.getPiecesRange())
 		}
 	}
