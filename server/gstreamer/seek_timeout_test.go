@@ -4,6 +4,7 @@ package gstreamer
 
 import (
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unsafe"
@@ -32,19 +33,20 @@ func TestReusePipelineTreatsSettledEOSAsASeekFailure(t *testing.T) {
 	getState := api.gstElementGetState
 	// State is checked twice: once pausing before the seek, once validating after the wait.
 	// Arming on the second is what puts the EOS in the window the old code walked through.
-	stateChecks := 0
-	seekWaitOver := false
+	// The bus watcher reads these from its own goroutine, so plain int/bool here would be a
+	// race in the harness itself — and a race reported against the harness is how a package
+	// ends up excluded from -race.
+	var stateChecks atomic.Int32
+	var seekWaitOver atomic.Bool
 
 	api.gstElementGetState = func(element uintptr, state unsafe.Pointer, pending unsafe.Pointer, timeout uint64) int32 {
-		stateChecks++
-		seekWaitOver = stateChecks >= 2
+		seekWaitOver.Store(stateChecks.Add(1) >= 2)
 		return getState(element, state, pending, timeout)
 	}
 	// Exactly once: a bus that keeps handing out the same EOS would spin any later reader.
-	eosDelivered := false
+	var eosDelivered atomic.Bool
 	api.gstBusTimedPopFiltered = func(b uintptr, timeout uint64, filter int32) uintptr {
-		if seekWaitOver && !eosDelivered && filter&gstMessageEOS != 0 {
-			eosDelivered = true
+		if seekWaitOver.Load() && filter&gstMessageEOS != 0 && eosDelivered.CompareAndSwap(false, true) {
 			return 9
 		}
 		return bus(b, timeout, filter)

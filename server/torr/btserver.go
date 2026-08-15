@@ -81,6 +81,16 @@ func (bt *BTServer) Disconnect() {
 	}
 }
 
+// establishedConnsPerTorrent is the client's per-torrent connection budget.
+//
+// The per-reader floor in torrstor deliberately lets the readers of one torrent ask for more
+// than ConnectionsLimit together. The client reads this value once, at startup, so this is the
+// only place that can honour that — a budget below it caps the floor silently, at the exact
+// moment a household is watching the same release together.
+func establishedConnsPerTorrent() int {
+	return max(settings.BTsets.ConnectionsLimit, torrstor.MaxConnectionsNeeded())
+}
+
 func (bt *BTServer) configure(ctx context.Context) {
 	blocklist, _ := utils.ReadBlockedIP()
 	bt.config = torrent.NewDefaultClientConfig()
@@ -118,7 +128,7 @@ func (bt *BTServer) configure(ctx context.Context) {
 	bt.config.UpnpID = upnpID
 	bt.config.HTTPUserAgent = userAgent
 	bt.config.ExtendedHandshakeClientVersion = cliVers
-	bt.config.EstablishedConnsPerTorrent = settings.BTsets.ConnectionsLimit
+	bt.config.EstablishedConnsPerTorrent = establishedConnsPerTorrent()
 	bt.config.TotalHalfOpenConns = 500
 	// Encryption/Obfuscation
 	bt.config.EncryptionPolicy = torrent.EncryptionPolicy{ //	OE

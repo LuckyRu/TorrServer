@@ -615,9 +615,9 @@ func TestStartPipelineUsesActualQueriedSeekPosition(t *testing.T) {
 		gstRuntime = previous
 	})
 
-	var seekPad uintptr
-	var seekPosition int64
-	seekPending := false
+	var seekPad atomic.Uintptr
+	var seekPosition atomic.Int64
+	var seekPending atomic.Bool
 	gstRuntime = &gstAPI{
 		gstParseLaunch: func(string, unsafe.Pointer) uintptr { return 1 },
 		gstBinGetByName: func(_ uintptr, name string) uintptr {
@@ -643,15 +643,15 @@ func TestStartPipelineUsesActualQueriedSeekPosition(t *testing.T) {
 			if rate != 1 || format != gstFormatTime || startType != gstSeekTypeSet || stopType != gstSeekTypeNone || stop != -1 {
 				t.Fatalf("unexpected seek event: rate=%v format=%d flags=%d startType=%d start=%d stopType=%d stop=%d", rate, format, flags, startType, start, stopType, stop)
 			}
-			seekPosition = start
+			seekPosition.Store(start)
 			return 6
 		},
 		gstPadSendEvent: func(pad uintptr, event uintptr) int32 {
-			seekPad = pad
+			seekPad.Store(pad)
 			if event != 6 {
 				t.Fatalf("event=%d, want 6", event)
 			}
-			seekPending = true
+			seekPending.Store(true)
 			return 1
 		},
 		gstElementQueryPosition: func(_ uintptr, _ int32, cur unsafe.Pointer) int32 {
@@ -659,8 +659,7 @@ func TestStartPipelineUsesActualQueriedSeekPosition(t *testing.T) {
 			return 1
 		},
 		gstBusTimedPopFiltered: func(_ uintptr, _ uint64, filter int32) uintptr {
-			if filter == gstMessageAsyncDone && seekPending {
-				seekPending = false
+			if filter == gstMessageAsyncDone && seekPending.CompareAndSwap(true, false) {
 				return 7
 			}
 			return 0
@@ -683,11 +682,11 @@ func TestStartPipelineUsesActualQueriedSeekPosition(t *testing.T) {
 	if actual != 16 {
 		t.Fatalf("actual=%v, want 16", actual)
 	}
-	if seekPad != 5 {
-		t.Fatalf("seek pad=%d, want mq.src_0", seekPad)
+	if seekPad.Load() != 5 {
+		t.Fatalf("seek pad=%d, want mq.src_0", seekPad.Load())
 	}
-	if seekPosition != int64(12*time.Second) {
-		t.Fatalf("seek position=%d, want %d", seekPosition, int64(12*time.Second))
+	if seekPosition.Load() != int64(12*time.Second) {
+		t.Fatalf("seek position=%d, want %d", seekPosition.Load(), int64(12*time.Second))
 	}
 	runner.stopPipeline()
 
@@ -821,17 +820,44 @@ func TestReusePipelineFailureFreezesAndReleasesPipeline(t *testing.T) {
 		t.Fatal("video probe state remains registered after reusePipeline failure")
 	}
 	for _, handle := range []uintptr{1, 2, 3, 9} {
-		if unrefs[handle] != 1 {
-			t.Fatalf("native handle %d unref count=%d, want 1", handle, unrefs[handle])
+		if unrefs.count(handle) != 1 {
+			t.Fatalf("native handle %d unref count=%d, want 1", handle, unrefs.count(handle))
 		}
 	}
 }
 
-func newReusePipelineTestRunner(t *testing.T, queryResult int32, queryPosition int64, sendSeekResult int32, emitAsyncDone bool) (*gstRunner, map[uintptr]int) {
+// unrefCounter is the fake's unref tally. gstObjectUnref is called from whichever goroutine
+// happens to release the handle, so the map behind it needs a lock of its own.
+type unrefCounter struct {
+	mu     sync.Mutex
+	counts map[uintptr]int
+}
+
+func newUnrefCounter() *unrefCounter {
+	return &unrefCounter{counts: make(map[uintptr]int)}
+}
+
+func (c *unrefCounter) note(handle uintptr) {
+	c.mu.Lock()
+	c.counts[handle]++
+	c.mu.Unlock()
+}
+
+func (c *unrefCounter) count(handle uintptr) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.counts[handle]
+}
+
+func newReusePipelineTestRunner(t *testing.T, queryResult int32, queryPosition int64, sendSeekResult int32, emitAsyncDone bool) (*gstRunner, *unrefCounter) {
 	t.Helper()
 
-	seekPending := false
-	unrefs := make(map[uintptr]int)
+	// The bus watcher runs in its own goroutine, so every piece of fake state it can touch
+	// needs real synchronisation. A race reported against the harness gets filed as "test
+	// noise", and the package it protects gets dropped from -race soon after.
+	var seekPending atomic.Bool
+	var busDisabled atomic.Bool
+	unrefs := newUnrefCounter()
 	api := &gstAPI{}
 	api.gstBinGetByName = func(_ uintptr, name string) uintptr {
 		switch name {
@@ -847,7 +873,7 @@ func newReusePipelineTestRunner(t *testing.T, queryResult int32, queryPosition i
 		if state == gstStatePlaying {
 			// reusePipeline has already consumed the seek message. Disabling the
 			// fake bus prevents its watcher from spinning after this point.
-			api.gstBusTimedPopFiltered = nil
+			busDisabled.Store(true)
 		}
 		return gstStateChangeSuccess
 	}
@@ -867,7 +893,7 @@ func newReusePipelineTestRunner(t *testing.T, queryResult int32, queryPosition i
 		if pad != 6 || event != 7 {
 			t.Fatalf("unexpected seek event: pad=%d event=%d", pad, event)
 		}
-		seekPending = sendSeekResult != 0
+		seekPending.Store(sendSeekResult != 0)
 		return sendSeekResult
 	}
 	api.gstElementQueryPosition = func(_ uintptr, format int32, position unsafe.Pointer) int32 {
@@ -878,15 +904,17 @@ func newReusePipelineTestRunner(t *testing.T, queryResult int32, queryPosition i
 		return queryResult
 	}
 	api.gstBusTimedPopFiltered = func(_ uintptr, _ uint64, filter int32) uintptr {
-		if filter == gstMessageAsyncDone && seekPending && emitAsyncDone {
-			seekPending = false
+		if busDisabled.Load() {
+			return 0
+		}
+		if filter == gstMessageAsyncDone && emitAsyncDone && seekPending.CompareAndSwap(true, false) {
 			return 8
 		}
 		return 0
 	}
 	api.gstPadRemoveProbe = func(uintptr, uintptr) {}
 	api.gstObjectUnref = func(handle uintptr) {
-		unrefs[handle]++
+		unrefs.note(handle)
 	}
 	api.gstMiniObjectUnref = func(uintptr) {}
 	gstRuntime = api
