@@ -46,6 +46,7 @@ type Cache struct {
 	isRemove atomic.Bool
 	isClosed atomic.Bool
 	muRemove sync.Mutex
+	muSweep  sync.Mutex
 	torrent  *torrent.Torrent
 }
 
@@ -232,13 +233,13 @@ func (c *Cache) GetState() *state.CacheState {
 	var fill int64 = 0
 
 	for _, p := range c.getPieces() {
-		if p.Size > 0 {
-			fill += p.Size
+		if size := p.Size.Load(); size > 0 {
+			fill += size
 			piecesState[p.Id] = state.ItemState{
 				Id:        p.Id,
-				Size:      p.Size,
+				Size:      size,
 				Length:    c.pieceLength,
-				Completed: p.Complete,
+				Completed: p.Complete.Load(),
 				Priority:  int(c.torrent.PieceState(p.Id).Priority),
 			}
 		}
@@ -296,13 +297,28 @@ func (c *Cache) cleanPieces() {
 	}
 }
 
+// getRemPieces recomputes what may be evicted and refreshes piece priorities.
+//
+// One sweep at a time: every reader that closes kicks one off, so a household switching
+// episodes starts several at once, and two sweeps interleaving hand the torrent
+// contradictory piece priorities.
 func (c *Cache) getRemPieces() []*Piece {
+	c.muSweep.Lock()
+	defer c.muSweep.Unlock()
+
 	readers := c.readersSnapshot()
 
-	// Collect read ranges from active readers
-	ranges := make([]Range, 0)
+	// Settle which readers count as active before measuring anything. checkReader flips
+	// isUse, and a reader's window is the capacity divided by the number of active ones -
+	// so deciding and measuring in one pass gave each reader a different divisor, in map
+	// order, which Go randomises deliberately.
 	for _, r := range readers {
 		r.checkReader()
+	}
+
+	// Collect read ranges from active readers
+	ranges := make([]Range, 0, len(readers))
+	for _, r := range readers {
 		if r.isUse.Load() {
 			ranges = append(ranges, r.getPiecesRange())
 		}
@@ -314,18 +330,19 @@ func (c *Cache) getRemPieces() []*Piece {
 
 	// Determine which chunks can be deleted
 	for id, p := range c.getPieces() {
-		if p.Size > 0 {
-			fill += p.Size
+		size := p.Size.Load()
+		if size > 0 {
+			fill += size
 		}
 		if len(ranges) > 0 {
 			if !inRanges(ranges, id) {
-				if p.Size > 0 && !c.isIdInFileBE(ranges, id) {
+				if size > 0 && !c.isIdInFileBE(ranges, id) {
 					piecesRemove = append(piecesRemove, p)
 				}
 			}
 		} else {
 			// When preloading, clear everything except the beginning and end of the file
-			if p.Size > 0 && !c.isIdInFileBE(ranges, id) {
+			if size > 0 && !c.isIdInFileBE(ranges, id) {
 				piecesRemove = append(piecesRemove, p)
 			}
 		}
@@ -336,7 +353,7 @@ func (c *Cache) getRemPieces() []*Piece {
 
 	// Sort by last access time (oldest first)
 	sort.Slice(piecesRemove, func(i, j int) bool {
-		return piecesRemove[i].Accessed < piecesRemove[j].Accessed
+		return piecesRemove[i].Accessed.Load() < piecesRemove[j].Accessed.Load()
 	})
 
 	c.filled.Store(fill)
@@ -372,7 +389,7 @@ func (c *Cache) setLoadPriority(ranges []Range) {
 		end := r.getPiecesRange().End
 		limit := 0
 		for i := readerPos; i < end && limit < count; i++ {
-			if !pieces[i].Complete {
+			if !pieces[i].Complete.Load() {
 				if i == readerPos {
 					c.torrent.Piece(i).SetPriority(torrent.PiecePriorityNow)
 				} else if i == readerPos+1 {
