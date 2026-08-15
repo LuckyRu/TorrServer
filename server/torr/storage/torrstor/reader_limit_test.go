@@ -45,22 +45,19 @@ func TestAdmitReaderDoesNotOvershootUnderConcurrency(t *testing.T) {
 	cache := &Cache{readers: make(map[*Reader]struct{})}
 
 	const callers = maxReadersPerTorrent * 4
-	var wait sync.WaitGroup
 	var mu sync.Mutex
 	admitted := 0
 
-	wait.Add(callers)
-	for range callers {
-		go func() {
-			defer wait.Done()
-			if err := cache.admitReader(&Reader{cache: cache}); err == nil {
-				mu.Lock()
-				admitted++
-				mu.Unlock()
-			}
-		}()
-	}
-	wait.Wait()
+	// The barrier is the point: without it the first callers finish before the last are
+	// created, and a check separated from its publish would still admit exactly the limit
+	// most of the time.
+	startTogether(callers, func(int) {
+		if err := cache.admitReader(&Reader{cache: cache}); err == nil {
+			mu.Lock()
+			admitted++
+			mu.Unlock()
+		}
+	})
 
 	if admitted != maxReadersPerTorrent {
 		t.Fatalf("admitted %d readers, want exactly %d", admitted, maxReadersPerTorrent)

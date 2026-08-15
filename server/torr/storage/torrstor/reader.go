@@ -15,7 +15,9 @@ import (
 
 type Reader struct {
 	torrent.Reader
-	file *torrent.File
+	// file is behind an interface so a reader can exist in a test without a torrent client
+	// behind it; see source.go.
+	file readerFile
 
 	// offset, readahead and isUse are written by the goroutine serving this stream and read
 	// by the cache maintenance that walks every reader of the torrent. Reader.mu orders the
@@ -38,7 +40,7 @@ type Reader struct {
 // would hold the HTTP connections open and only move the problem.
 var ErrTooManyReaders = errors.New("too many concurrent readers on this torrent")
 
-func newReader(file *torrent.File, cache *Cache) (*Reader, error) {
+func newReader(file readerFile, cache *Cache) (*Reader, error) {
 	r := new(Reader)
 	r.file = file
 	r.Reader = file.NewReader()
@@ -80,7 +82,7 @@ func (r *Reader) Read(p []byte) (n int, err error) {
 	if r.isClosed.Load() {
 		return
 	}
-	if r.file.Torrent() != nil && r.file.Torrent().Info() != nil {
+	if r.file.HasInfo() {
 		r.readerOn()
 		n, err = r.Reader.Read(p)
 
@@ -134,7 +136,7 @@ func (r *Reader) Close() {
 	// file reader close in gotorrent
 	// this struct close in cache
 	r.isClosed.Store(true)
-	if len(r.file.Torrent().Files()) > 0 {
+	if r.file.HasFiles() {
 		r.Reader.Close()
 	}
 	go r.cache.getRemPieces()
