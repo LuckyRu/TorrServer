@@ -156,13 +156,23 @@ func (r *gstRunner) installVideoStartProbe(pipeline uintptr, requestedNS uint64)
 	}
 }
 
+// Точная перемотка ставит демиксер на keyframe перед целью: кадры до неё нужны декодеру как
+// опорные, но зрителю они уже показаны. Обрезаем их по PTS, иначе поток уезжает назад.
+//
+// Место обрезки зависит от режима. При passthrough кадры копируются, и лишнее снимается после
+// таймстемпера. Под транскодом обрезать надо ДО энкодера: он должен получить первым кадр ровно
+// с запрошенной позиции и сделать его опорным. Срежь после энкодера — и сегмент начнётся с
+// кадра, которому нужен выброшенный keyframe.
 func (r *gstRunner) installVideoSegmentClipProbe(pipeline uintptr, requestedStart uint64) {
-	passthrough := !videoIsTranscoded(r.task.Config, r.task.Probe)
-	if !passthrough || (!r.task.Probe.IsH264() && !r.task.Probe.IsH265()) {
-		return
+	var pad uintptr
+	if videoIsTranscoded(r.task.Config, r.task.Probe) {
+		pad = gstPipelineElementPad(gstRuntime, pipeline, "video_encoder", "sink")
+	} else {
+		if !r.task.Probe.IsH264() && !r.task.Probe.IsH265() {
+			return
+		}
+		pad = gstPipelineElementPad(gstRuntime, pipeline, "video_timestamper", "src")
 	}
-
-	pad := gstPipelineElementPad(gstRuntime, pipeline, "video_timestamper", "src")
 	if pad == 0 {
 		return
 	}
