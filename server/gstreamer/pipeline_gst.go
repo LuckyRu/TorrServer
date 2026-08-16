@@ -693,34 +693,13 @@ func (r *gstRunner) transcodeToH264(sb *strings.Builder) {
 	sb.WriteString("h264parse config-interval=0 ! h264timestamper name=video_timestamper ! video/x-h264,profile=main,stream-format=avc,alignment=au ! mux.video_0 ")
 }
 
-func videoIsTranscoded(conf Config, probe ProbeInfo) bool {
-	if conf.HDRToSDR && probe.Video() != nil && probe.Video().IsHDRVideo() {
-		return true
-	}
-	if conf.TranscodeAVI && probe.IsAVIContainer() {
-		return true
-	}
-	switch {
-	case probe.IsH264():
-		return conf.TranscodeH264
-	case probe.IsH265():
-		return conf.TranscodeH265
-	case probe.IsAV1():
-		return conf.TranscodeAV1
-	case probe.IsVP9():
-		return conf.TranscodeVP9
-	default:
-		return probe.VideoCapsName() != ""
-	}
-}
-
 func (r *gstRunner) Seek(seconds float64) bool {
 	r.ensureTransientState()
 	r.discardReadySegment()
 	r.resetSubtitleProgress(seconds)
 	wasFrozen := r.IsFrozen()
 	reuse := r.pipeline != 0
-	accurate := r.task.Cue != nil
+	accurate := r.task.seekCanBeAccurate()
 	gstTaskDebugf(r.task, "seek requested=%.3fs reuse=%t accurate=%t", seconds, reuse, accurate)
 
 	var actualSeconds float64
@@ -1372,8 +1351,9 @@ func (r *gstRunner) startPipeline(seconds float64) (float64, error) {
 			return 0, err
 		}
 
+		accurate := r.task.seekCanBeAccurate()
 		flags := gstSeekFlagFlush | gstSeekFlagKeyUnit | gstSeekFlagSnapAfter
-		if r.task.Cue != nil {
+		if accurate {
 			flags |= gstSeekFlagAccurate
 		}
 		if err := gstRuntime.popBusError(bus, 0); err != nil {
@@ -1386,7 +1366,7 @@ func (r *gstRunner) startPipeline(seconds float64) (float64, error) {
 			cleanup()
 			return 0, errors.New("gstreamer seek position is negative")
 		}
-		r.installVideoSeekProbes(pipeline, uint64(seekNS), r.task.Cue != nil)
+		r.installVideoSeekProbes(pipeline, uint64(seekNS), accurate)
 		if err := sendVideoSeekEvent(pipeline, flags, seekNS); err != nil {
 			cleanup()
 			return 0, fmt.Errorf("gstreamer seek failed: %w", err)
