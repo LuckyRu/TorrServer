@@ -187,6 +187,46 @@ func (t *Task) hasInitMP4() bool {
 	return len(t.initMP4) > 0
 }
 
+// Живёт здесь, а не рядом с построением пайплайна: решение «транскодируем ли видео» нужно и
+// логике задачи, а файл пайплайна собирается только под конкретные платформы.
+func videoIsTranscoded(conf Config, probe ProbeInfo) bool {
+	if conf.HDRToSDR && probe.Video() != nil && probe.Video().IsHDRVideo() {
+		return true
+	}
+	if conf.TranscodeAVI && probe.IsAVIContainer() {
+		return true
+	}
+	switch {
+	case probe.IsH264():
+		return conf.TranscodeH264
+	case probe.IsH265():
+		return conf.TranscodeH265
+	case probe.IsAV1():
+		return conf.TranscodeAV1
+	case probe.IsVP9():
+		return conf.TranscodeVP9
+	default:
+		return probe.VideoCapsName() != ""
+	}
+}
+
+// seekCanBeAccurate отвечает на вопрос «можно ли отдать кадр ровно с запрошенной позиции»,
+// а не «есть ли у нас индекс keyframe'ов» — это разные вещи, и раньше они были слеплены в одну.
+//
+// Точная перемотка возможна там, где поток и так декодируется покадрово: транскод декодирует
+// всё, а энкодер ставит свой keyframe на границе сегмента (key-int-max), поэтому доехать до
+// точного кадра ничего не стоит сверх уже выполняемой работы.
+//
+// При passthrough кадры копируются как есть, и начать поток можно только с keyframe исходника —
+// значит нужен его индекс. Для Matroska он читается в CueTimeline; для остальных контейнеров
+// индекса пока нет, и запрашивать точность бессмысленно: демиксер всё равно отдаст keyframe.
+func (t *Task) seekCanBeAccurate() bool {
+	if t.Cue != nil {
+		return true
+	}
+	return videoIsTranscoded(t.Config, t.Probe)
+}
+
 func (t *Task) segmentStartNS(index int) uint64 {
 	if cue, ok := t.Cue.Segment(index); ok {
 		return cue.StartNS
