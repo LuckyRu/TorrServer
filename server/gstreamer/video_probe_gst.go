@@ -101,7 +101,7 @@ type videoStartProbeState struct {
 	actualNS      atomic.Uint64
 }
 
-type videoSegmentClipProbeState struct {
+type segmentClipProbeState struct {
 	registration   *gstPadProbeRegistration
 	requestedStart uint64
 	segmentStart   atomic.Uint64
@@ -111,8 +111,8 @@ var (
 	videoProbeStates    sync.Map
 	videoProbeNextToken atomic.Uint64
 
-	videoStartProbeCallback = purego.NewCallback(videoStartPadProbe)
-	videoClipProbeCallback  = purego.NewCallback(videoSegmentClipPadProbe)
+	videoStartProbeCallback  = purego.NewCallback(videoStartPadProbe)
+	segmentClipProbeCallback = purego.NewCallback(segmentClipPadProbe)
 )
 
 func (r *gstRunner) installVideoSeekProbes(pipeline uintptr, requestedNS uint64, accurate bool) {
@@ -127,6 +127,7 @@ func (r *gstRunner) installVideoSeekProbes(pipeline uintptr, requestedNS uint64,
 		clipStart = requestedNS
 	}
 	r.installVideoSegmentClipProbe(pipeline, clipStart)
+	r.installAudioSegmentClipProbe(pipeline, clipStart)
 }
 
 func (r *gstRunner) installVideoStartProbe(pipeline uintptr, requestedNS uint64) {
@@ -156,28 +157,62 @@ func (r *gstRunner) installVideoStartProbe(pipeline uintptr, requestedNS uint64)
 	}
 }
 
+// Точная перемотка ставит демиксер на keyframe перед целью: кадры до неё нужны декодеру как
+// опорные, но зрителю они уже показаны. Обрезаем их по PTS, иначе поток уезжает назад.
+//
+// Место обрезки зависит от режима. При passthrough кадры копируются, и лишнее снимается после
+// таймстемпера. Под транскодом обрезать надо ДО энкодера: он должен получить первым кадр ровно
+// с запрошенной позиции и сделать его опорным. Срежь после энкодера — и сегмент начнётся с
+// кадра, которому нужен выброшенный keyframe.
 func (r *gstRunner) installVideoSegmentClipProbe(pipeline uintptr, requestedStart uint64) {
-	passthrough := !videoIsTranscoded(r.task.Config, r.task.Probe)
-	if !passthrough || (!r.task.Probe.IsH264() && !r.task.Probe.IsH265()) {
-		return
+	var pad uintptr
+	if videoIsTranscoded(r.task.Config, r.task.Probe) {
+		pad = gstPipelineElementPad(gstRuntime, pipeline, "video_encoder", "sink")
+	} else {
+		if !r.task.Probe.IsH264() && !r.task.Probe.IsH265() {
+			return
+		}
+		pad = gstPipelineElementPad(gstRuntime, pipeline, "video_timestamper", "src")
 	}
-
-	pad := gstPipelineElementPad(gstRuntime, pipeline, "video_timestamper", "src")
 	if pad == 0 {
 		return
 	}
 
-	state := &videoSegmentClipProbeState{requestedStart: requestedStart}
+	state := &segmentClipProbeState{requestedStart: requestedStart}
 	state.segmentStart.Store(requestedStart)
 	r.videoClipProbe = addVideoPadProbe(
 		gstRuntime,
 		pad,
 		gstPadProbeTypeEventDownstream|gstPadProbeTypeBuffer,
-		videoClipProbeCallback,
+		segmentClipProbeCallback,
 		state,
 	)
 	if r.videoClipProbe != nil {
 		state.registration = r.videoClipProbe
+	}
+}
+
+// При ACCURATE demuxer начинает обе дорожки с данных перед целью: видео нужны опорные кадры,
+// аудио приезжает с той же ранней временной шкалой. Если обрезать только видео, ранние аудиофреймы
+// уже попадают в mp4mux и после перемотки звук опережает изображение на длину GOP. Ставим тот же
+// PTS-барьер после AAC parser: для copy и transcode это последняя общая точка перед mux.
+func (r *gstRunner) installAudioSegmentClipProbe(pipeline uintptr, requestedStart uint64) {
+	pad := gstPipelineElementPad(gstRuntime, pipeline, "audio_clipper", "src")
+	if pad == 0 {
+		return
+	}
+
+	state := &segmentClipProbeState{requestedStart: requestedStart}
+	state.segmentStart.Store(requestedStart)
+	r.audioClipProbe = addVideoPadProbe(
+		gstRuntime,
+		pad,
+		gstPadProbeTypeEventDownstream|gstPadProbeTypeBuffer,
+		segmentClipProbeCallback,
+		state,
+	)
+	if r.audioClipProbe != nil {
+		state.registration = r.audioClipProbe
 	}
 }
 
@@ -227,6 +262,7 @@ func addVideoPadProbe(api *gstAPI, pad uintptr, mask uint32, callback uintptr, s
 func (r *gstRunner) removeVideoSeekProbes() {
 	removeVideoPadProbe(&r.videoStartProbe)
 	removeVideoPadProbe(&r.videoClipProbe)
+	removeVideoPadProbe(&r.audioClipProbe)
 }
 
 func removeVideoPadProbe(target **gstPadProbeRegistration) {
@@ -312,7 +348,7 @@ func (state *videoStartProbeState) accepts(clockTime uint64) bool {
 	return state.requestedNS <= state.maxBackDiffNS || clockTime >= state.requestedNS-state.maxBackDiffNS
 }
 
-func videoSegmentClipPadProbe(_ purego.CDecl, _ uintptr, info uintptr, userData uintptr) (result uintptr) {
+func segmentClipPadProbe(_ purego.CDecl, _ uintptr, info uintptr, userData uintptr) (result uintptr) {
 	result = gstPadProbeOK
 	defer func() {
 		if recover() != nil {
@@ -324,7 +360,7 @@ func videoSegmentClipPadProbe(_ purego.CDecl, _ uintptr, info uintptr, userData 
 	if !ok {
 		return gstPadProbeRemove
 	}
-	state, ok := value.(*videoSegmentClipProbeState)
+	state, ok := value.(*segmentClipProbeState)
 	if !ok || state.registration == nil {
 		return gstPadProbeRemove
 	}
