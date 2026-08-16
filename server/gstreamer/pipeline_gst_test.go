@@ -106,7 +106,7 @@ func TestCreatePipelineArgsCopiesAACAudio(t *testing.T) {
 	)
 
 	args := runner.createPipelineArgs()
-	want := "d.audio_1 ! mq.sink_1 mq.src_1 ! aacparse ! audio/mpeg,mpegversion=4,stream-format=raw ! mux.audio_0"
+	want := "d.audio_1 ! mq.sink_1 mq.src_1 ! aacparse name=audio_clipper ! audio/mpeg,mpegversion=4,stream-format=raw ! mux.audio_0"
 	if !strings.Contains(args, want) {
 		t.Fatalf("createPipelineArgs() =\n%s\nwant %q", args, want)
 	}
@@ -130,7 +130,7 @@ func TestCreatePipelineArgsEncodesNonAACAudio(t *testing.T) {
 	for _, want := range []string{
 		"d.audio_0 ! mq.sink_1 mq.src_1 ! decodebin ! audioconvert",
 		"avenc_aac bitrate=",
-		"aacparse ! audio/mpeg,mpegversion=4,stream-format=raw,rate=48000,channels=2 ! mux.audio_0",
+		"aacparse name=audio_clipper ! audio/mpeg,mpegversion=4,stream-format=raw,rate=48000,channels=2 ! mux.audio_0",
 	} {
 		if !strings.Contains(args, want) {
 			t.Fatalf("createPipelineArgs() =\n%s\nwant %q", args, want)
@@ -157,7 +157,7 @@ func TestCreatePipelineArgsUsesProbeAudioCapsWhenConfigAuto(t *testing.T) {
 	args := runner.createPipelineArgs()
 	for _, want := range []string{
 		"audio/x-raw,format=F32LE,layout=interleaved,rate=44100,channels=6,channel-mask=(bitmask)0x000000000000003f",
-		"aacparse ! audio/mpeg,mpegversion=4,stream-format=raw,rate=44100,channels=6 ! mux.audio_0",
+		"aacparse name=audio_clipper ! audio/mpeg,mpegversion=4,stream-format=raw,rate=44100,channels=6 ! mux.audio_0",
 	} {
 		if !strings.Contains(args, want) {
 			t.Fatalf("createPipelineArgs() =\n%s\nwant %q", args, want)
@@ -186,7 +186,7 @@ func TestCreatePipelineArgsConfigOverridesProbeAudioCaps(t *testing.T) {
 	args := runner.createPipelineArgs()
 	for _, want := range []string{
 		"audio/x-raw,format=F32LE,layout=interleaved,rate=32000,channels=1",
-		"aacparse ! audio/mpeg,mpegversion=4,stream-format=raw,rate=32000,channels=1 ! mux.audio_0",
+		"aacparse name=audio_clipper ! audio/mpeg,mpegversion=4,stream-format=raw,rate=32000,channels=1 ! mux.audio_0",
 	} {
 		if !strings.Contains(args, want) {
 			t.Fatalf("createPipelineArgs() =\n%s\nwant %q", args, want)
@@ -813,8 +813,8 @@ func TestReusePipelineFailureFreezesAndReleasesPipeline(t *testing.T) {
 	if runner.reader != nil {
 		t.Fatal("MP4 reader was retained after reusePipeline failure")
 	}
-	if runner.videoStartProbe != nil || runner.videoClipProbe != nil {
-		t.Fatal("video probes were retained after reusePipeline failure")
+	if runner.videoStartProbe != nil || runner.videoClipProbe != nil || runner.audioClipProbe != nil {
+		t.Fatal("seek probes were retained after reusePipeline failure")
 	}
 	if _, ok := videoProbeStates.Load(registration.token); ok {
 		t.Fatal("video probe state remains registered after reusePipeline failure")
