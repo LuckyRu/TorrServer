@@ -693,6 +693,21 @@ func (r *gstRunner) transcodeToH264(sb *strings.Builder) {
 	sb.WriteString("h264parse config-interval=0 ! h264timestamper name=video_timestamper ! video/x-h264,profile=main,stream-format=avc,alignment=au ! mux.video_0 ")
 }
 
+// KEY_UNIT со SNAP_AFTER и ACCURATE — взаимоисключающие требования: первые два просят
+// ближайший keyframe после позиции, третий — кадр ровно на позиции. Вместе побеждают первые
+// два, и ACCURATE не даёт ничего.
+//
+// Для Matroska это было незаметно: границы сегментов там берутся из индекса и сами лежат на
+// keyframe'ах, поэтому SNAP_AFTER никуда не сдвигал. Под транскодом keyframe'ы исходника с
+// границами сегментов не совпадают, и перемотка уезжала вперёд до следующего — на живом AVI
+// это давало +5.5 с и одиннадцать секунд ожидания.
+func videoSeekFlags(accurate bool) int32 {
+	if accurate {
+		return gstSeekFlagFlush | gstSeekFlagAccurate
+	}
+	return gstSeekFlagFlush | gstSeekFlagKeyUnit | gstSeekFlagSnapAfter
+}
+
 func (r *gstRunner) Seek(seconds float64) bool {
 	r.ensureTransientState()
 	r.discardReadySegment()
@@ -774,10 +789,7 @@ func (r *gstRunner) reusePipeline(seconds float64, accurate bool, waitTimeout ti
 	r.positionSeekSeconds = seconds
 	r.setPosition(seconds)
 
-	flags := gstSeekFlagFlush | gstSeekFlagKeyUnit | gstSeekFlagSnapAfter
-	if accurate {
-		flags |= gstSeekFlagAccurate
-	}
+	flags := videoSeekFlags(accurate)
 	seekNS := int64(math.Round(seconds * 1_000_000_000))
 	if seekNS < 0 {
 		return 0, errors.New("gstreamer seek position is negative")
@@ -818,7 +830,7 @@ func (r *gstRunner) reusePipeline(seconds float64, accurate bool, waitTimeout ti
 		return 0, errors.New("gstreamer reached EOS while completing seek")
 	}
 
-	actualSeconds := r.querySeekPosition(r.pipeline, seconds)
+	actualSeconds := r.seekPositionAfter(r.pipeline, seconds, accurate)
 	if err := r.setPipelineState(r.pipeline, r.bus, gstStatePlaying); err != nil {
 		return 0, fmt.Errorf("resume pipeline after seek: %w", err)
 	}
@@ -843,6 +855,18 @@ func sendVideoSeekEvent(pipeline uintptr, flags int32, positionNS int64) error {
 		return errors.New("video seek event returned false")
 	}
 	return nil
+}
+
+// Позиция, с которой поток реально пойдёт наружу. Запрос к пайплайну возвращает позицию
+// демиксера, а при точной перемотке он стоит на опорном кадре ПЕРЕД целью — кадры между ними
+// обрезает clip probe. Отдать эту позицию наружу значит соврать на длину GOP назад: сегменты
+// начнут строиться раньше запрошенного, и плеер получит уже показанное.
+func (r *gstRunner) seekPositionAfter(pipeline uintptr, requestedSeconds float64, accurate bool) float64 {
+	position := r.querySeekPosition(pipeline, requestedSeconds)
+	if accurate && position < requestedSeconds {
+		return requestedSeconds
+	}
+	return position
 }
 
 func (r *gstRunner) querySeekPosition(pipeline uintptr, requestedSeconds float64) float64 {
@@ -1352,10 +1376,7 @@ func (r *gstRunner) startPipeline(seconds float64) (float64, error) {
 		}
 
 		accurate := r.task.seekCanBeAccurate()
-		flags := gstSeekFlagFlush | gstSeekFlagKeyUnit | gstSeekFlagSnapAfter
-		if accurate {
-			flags |= gstSeekFlagAccurate
-		}
+		flags := videoSeekFlags(accurate)
 		if err := gstRuntime.popBusError(bus, 0); err != nil {
 			cleanup()
 			return 0, err
@@ -1408,7 +1429,7 @@ func (r *gstRunner) startPipeline(seconds float64) (float64, error) {
 			return 0, fmt.Errorf("unexpected GstStateChangeReturn=%d after seek", waitResult)
 		}
 
-		actualStartSeconds = r.querySeekPosition(pipeline, seconds)
+		actualStartSeconds = r.seekPositionAfter(pipeline, seconds, accurate)
 	}
 
 	if err := r.setPipelineState(pipeline, bus, gstStatePlaying); err != nil {
