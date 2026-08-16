@@ -72,6 +72,7 @@ type gstRunner struct {
 	subtitleStores  map[int]*subtitleStore
 	videoStartProbe *gstPadProbeRegistration
 	videoClipProbe  *gstPadProbeRegistration
+	audioClipProbe  *gstPadProbeRegistration
 
 	watchMu     sync.Mutex
 	watchCancel chan struct{}
@@ -492,7 +493,7 @@ func (r *gstRunner) createPipelineArgs() string {
 		sb.WriteString(strconv.Itoa(audioTrack.Index))
 		sb.WriteString(" ! mq.sink_1 mq.src_1 ! ")
 		if audioTrack.IsAACAudio() {
-			sb.WriteString("aacparse ! audio/mpeg,mpegversion=4,stream-format=raw ! mux.audio_0 ")
+			sb.WriteString("aacparse name=audio_clipper ! audio/mpeg,mpegversion=4,stream-format=raw ! mux.audio_0 ")
 		} else {
 			aacChannels := effectiveAACChannels(conf, audioTrack)
 			aacSampleRate := effectiveAACSampleRate(conf, audioTrack)
@@ -515,7 +516,7 @@ func (r *gstRunner) createPipelineArgs() string {
 			sb.WriteString(r.aacEncoder())
 			sb.WriteString(" bitrate=")
 			sb.WriteString(strconv.Itoa(aacBitrate))
-			sb.WriteString(" ! aacparse ! audio/mpeg,mpegversion=4,stream-format=raw,rate=")
+			sb.WriteString(" ! aacparse name=audio_clipper ! audio/mpeg,mpegversion=4,stream-format=raw,rate=")
 			sb.WriteString(strconv.Itoa(aacSampleRate))
 			sb.WriteString(",channels=")
 			sb.WriteString(strconv.Itoa(aacChannels))

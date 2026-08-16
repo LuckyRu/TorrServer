@@ -28,27 +28,27 @@ func TestSeekCanBeAccurate(t *testing.T) {
 
 	tests := []struct {
 		name string
-		task Task
+		task *Task
 		want bool
 	}{
 		{
 			name: "matroska с индексом keyframe'ов",
-			task: Task{Probe: matroska, Cue: &CueTimeline{}},
+			task: &Task{Probe: matroska, Cue: &CueTimeline{}},
 			want: true,
 		},
 		{
 			name: "AVI под транскодом: декодируется покадрово, индекс не нужен",
-			task: Task{Probe: avi, Config: Config{TranscodeAVI: true}},
+			task: &Task{Probe: avi, Config: Config{TranscodeAVI: true}},
 			want: true,
 		},
 		{
 			name: "H.264 под транскодом в любом контейнере",
-			task: Task{Probe: mp4, Config: Config{TranscodeH264: true}},
+			task: &Task{Probe: mp4, Config: Config{TranscodeH264: true}},
 			want: true,
 		},
 		{
 			name: "MP4 passthrough: кадры копируются, начать можно только с keyframe исходника",
-			task: Task{Probe: mp4},
+			task: &Task{Probe: mp4},
 			want: false,
 		},
 	}
