@@ -639,6 +639,84 @@ func torrentHeartbeatState(hash string) (state any) {
 	}
 }
 
+// Проекция CacheState под индикатор воспроизведения. Имена полей совпадают с heartbeat, чтобы
+// клиент читал оба ответа одним кодом.
+type playbackPiece struct {
+	Size      int64 `json:"Size"`
+	Completed bool  `json:"Completed"`
+}
+
+type playbackReader struct {
+	Start  int `json:"Start"`
+	End    int `json:"End"`
+	Reader int `json:"Reader"`
+}
+
+type playbackState struct {
+	Hash          string                `json:"Hash"`
+	PiecesLength  int64                 `json:"PiecesLength"`
+	PiecesCount   int                   `json:"PiecesCount"`
+	Capacity      int64                 `json:"Capacity"`
+	Filled        int64                 `json:"Filled"`
+	DownloadSpeed float64               `json:"DownloadSpeed"`
+	Readers       []playbackReader      `json:"Readers"`
+	Pieces        map[int]playbackPiece `json:"Pieces"`
+}
+
+// Клиент идёт по кускам от позиции читателя до конца его окна и останавливается на первом
+// незавершённом, поэтому куски за пределами окон читателей ему не нужны ни при каком развитии
+// событий. Именно они и составляют почти весь объём ответа heartbeat.
+func torrentPlaybackState(hash string) (result any) {
+	state := playbackState{Hash: hash, Pieces: map[int]playbackPiece{}}
+	result = state
+
+	defer func() {
+		if recover() != nil {
+			result = playbackState{Hash: hash, Pieces: map[int]playbackPiece{}}
+		}
+	}()
+
+	tor := getTorrentForGStreamer(hash)
+	if tor == nil {
+		return result
+	}
+
+	if status := tor.Status(); status != nil {
+		state.DownloadSpeed = status.DownloadSpeed
+	}
+
+	cacheState := tor.CacheState()
+	if cacheState == nil {
+		return state
+	}
+
+	state.PiecesLength = cacheState.PiecesLength
+	state.PiecesCount = cacheState.PiecesCount
+	state.Capacity = cacheState.Capacity
+	state.Filled = cacheState.Filled
+
+	for _, reader := range cacheState.Readers {
+		if reader == nil {
+			continue
+		}
+		state.Readers = append(state.Readers, playbackReader{
+			Start: reader.Start, End: reader.End, Reader: reader.Reader,
+		})
+		for index := reader.Reader; index <= reader.End; index++ {
+			if _, seen := state.Pieces[index]; seen {
+				continue
+			}
+			piece, ok := cacheState.Pieces[index]
+			if !ok {
+				continue
+			}
+			state.Pieces[index] = playbackPiece{Size: piece.Size, Completed: piece.Completed}
+		}
+	}
+
+	return state
+}
+
 func dropTorrentForGStreamer(hash string) {
 	defer func() {
 		_ = recover()
