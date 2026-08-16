@@ -91,7 +91,7 @@ func TestVideoStartProbeRejectsTimestampTooFarBehind(t *testing.T) {
 func TestVideoSegmentClipProbeDropsPreSeekBuffer(t *testing.T) {
 	buffer := &gstBufferABI{pts: uint64(91_000_000_000), dts: gstClockTimeNone}
 	info, keepInfo := testPadProbeInfo(gstPadProbeTypeBuffer, uintptr(unsafe.Pointer(buffer)))
-	state := &videoSegmentClipProbeState{requestedStart: 92_000_000_000}
+	state := &segmentClipProbeState{requestedStart: 92_000_000_000}
 	state.segmentStart.Store(92_000_000_000)
 	registration := &gstPadProbeRegistration{api: &gstAPI{}, state: state}
 	state.registration = registration
@@ -99,11 +99,11 @@ func TestVideoSegmentClipProbeDropsPreSeekBuffer(t *testing.T) {
 	videoProbeStates.Store(token, state)
 	t.Cleanup(func() { videoProbeStates.Delete(token) })
 
-	if result := videoSegmentClipPadProbe(purego.CDecl{}, 0, info, token); result != gstPadProbeDrop {
+	if result := segmentClipPadProbe(purego.CDecl{}, 0, info, token); result != gstPadProbeDrop {
 		t.Fatalf("probe result=%d, want DROP", result)
 	}
 	buffer.pts = 92_000_000_000
-	if result := videoSegmentClipPadProbe(purego.CDecl{}, 0, info, token); result != gstPadProbeOK {
+	if result := segmentClipPadProbe(purego.CDecl{}, 0, info, token); result != gstPadProbeOK {
 		t.Fatalf("probe result=%d at seek boundary, want OK", result)
 	}
 
@@ -124,7 +124,7 @@ func TestVideoSegmentClipProbeUsesDownstreamTimeSegment(t *testing.T) {
 			*(*uintptr)(output) = uintptr(unsafe.Pointer(segment))
 		},
 	}
-	state := &videoSegmentClipProbeState{requestedStart: gstClockTimeNone}
+	state := &segmentClipProbeState{requestedStart: gstClockTimeNone}
 	state.segmentStart.Store(gstClockTimeNone)
 	registration := &gstPadProbeRegistration{api: api, state: state}
 	state.registration = registration
@@ -132,7 +132,7 @@ func TestVideoSegmentClipProbeUsesDownstreamTimeSegment(t *testing.T) {
 	videoProbeStates.Store(token, state)
 	t.Cleanup(func() { videoProbeStates.Delete(token) })
 
-	if result := videoSegmentClipPadProbe(purego.CDecl{}, 0, info, token); result != gstPadProbeOK {
+	if result := segmentClipPadProbe(purego.CDecl{}, 0, info, token); result != gstPadProbeOK {
 		t.Fatalf("probe result=%d, want OK", result)
 	}
 	if got := state.segmentStart.Load(); got != segment.start {
@@ -142,6 +142,67 @@ func TestVideoSegmentClipProbeUsesDownstreamTimeSegment(t *testing.T) {
 	runtime.KeepAlive(segment)
 	runtime.KeepAlive(event)
 	runtime.KeepAlive(keepInfo)
+}
+
+func TestAccurateSeekInstallsSameClipBoundaryForAudioAndVideo(t *testing.T) {
+	previous := gstRuntime
+	api := &gstAPI{
+		gstBinGetByName: func(_ uintptr, name string) uintptr {
+			switch name {
+			case "mq":
+				return 10
+			case "video_encoder":
+				return 20
+			case "audio_clipper":
+				return 30
+			default:
+				return 0
+			}
+		},
+		gstElementGetStaticPad: func(element uintptr, name string) uintptr {
+			switch {
+			case element == 10 && name == "src_0":
+				return 101
+			case element == 20 && name == "sink":
+				return 102
+			case element == 30 && name == "src":
+				return 103
+			default:
+				return 0
+			}
+		},
+		gstPadAddProbe: func(pad uintptr, _ uint32, _ uintptr, _ uintptr, _ uintptr) uintptr {
+			return pad + 1000
+		},
+		gstPadRemoveProbe: func(_ uintptr, _ uintptr) {},
+		gstObjectUnref:    func(_ uintptr) {},
+	}
+	gstRuntime = api
+	t.Cleanup(func() { gstRuntime = previous })
+
+	runner := &gstRunner{task: &Task{
+		Config: Config{TranscodeH264: true},
+		Probe: ProbeInfo{Tracks: []TrackInfo{{
+			Type: "video", CapsName: "video/x-h264",
+		}}},
+	}}
+	const requested = uint64(92_000_000_000)
+	runner.installVideoSeekProbes(1, requested, true)
+	t.Cleanup(runner.removeVideoSeekProbes)
+
+	if runner.videoStartProbe == nil || runner.videoClipProbe == nil || runner.audioClipProbe == nil {
+		t.Fatalf("seek probes missing: start=%v video=%v audio=%v",
+			runner.videoStartProbe != nil, runner.videoClipProbe != nil, runner.audioClipProbe != nil)
+	}
+	videoState, videoOK := runner.videoClipProbe.state.(*segmentClipProbeState)
+	audioState, audioOK := runner.audioClipProbe.state.(*segmentClipProbeState)
+	if !videoOK || !audioOK {
+		t.Fatal("audio and video must use the same timestamp clip state")
+	}
+	if videoState.requestedStart != requested || audioState.requestedStart != requested {
+		t.Fatalf("clip boundaries differ: video=%d audio=%d want=%d",
+			videoState.requestedStart, audioState.requestedStart, requested)
+	}
 }
 
 func TestRemoveVideoPadProbeReleasesNativeRegistration(t *testing.T) {
