@@ -21,6 +21,7 @@ func (s *Service) SetupRoute(route gin.IRouter) {
 	route.GET("/gst/remove", s.remove)
 	route.GET("/gst/echo", s.echo)
 	route.GET("/gst/:hash/heartbeat", s.heartbeat)
+	route.GET("/gst/:hash/playback-state", s.playbackState)
 	route.GET("/gst/:hash/probe", s.probe)
 	route.GET("/gst/:hash/master.m3u8", s.master)
 
@@ -78,6 +79,22 @@ func (s *Service) heartbeat(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, torrentHeartbeatState(hash))
+}
+
+// playbackState — то же, что heartbeat, но обрезанное до того, что нужно индикатору
+// воспроизведения. heartbeat отдаёт весь CacheState: список файлов торрента, карту всех кусков и
+// служебные строки — на сериальном паке это порядка 43 КБ, и клиент разбирает их каждые две
+// секунды ради скорости и заполненности буфера. Здесь остаются только читаемые сейчас куски.
+func (s *Service) playbackState(c *gin.Context) {
+	noCache(c)
+
+	hash := c.Param("hash")
+	if !s.hasSessionForHash(hash) {
+		c.Status(http.StatusNotFound)
+		return
+	}
+
+	c.JSON(http.StatusOK, torrentPlaybackState(hash))
 }
 
 func (s *Service) probe(c *gin.Context) {
