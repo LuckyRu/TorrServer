@@ -68,7 +68,10 @@ func TestCreatePipelineArgsUsesASFDemuxer(t *testing.T) {
 
 func TestUnknownVideoCodecUsesTranscodePipeline(t *testing.T) {
 	runner := newVersionedVideoPipelineRunner(1.28)
-	runner.task.Probe.Tracks[0].CapsName = "video/x-theora"
+	// Caps выводится так же, как в парсере: подставить "video/x-theora" руками нельзя —
+	// codecToCapsName такого не возвращает, и тест проверял бы недостижимую ветку.
+	runner.task.Probe.Tracks[0].Codec = "Theora"
+	runner.task.Probe.Tracks[0].CapsName = codecToCapsName("video", "Theora")
 
 	args := runner.createPipelineArgs()
 	if !strings.Contains(args, "mq.src_0 ! decodebin !") {
@@ -331,6 +334,20 @@ func clearGStreamerRuntimeVersion(t *testing.T) {
 	t.Cleanup(func() {
 		gstRuntime = previous
 	})
+}
+
+// Задача с потоком, который копируется без декодера. Пустой ProbeInfo для этого не годится:
+// копировать в нём нечего, значит по правилу «не ремуксируем — транскодируем» такая задача
+// считается перекодируемой и требует энкодера в пайплайне.
+func passthroughVideoTask() *Task {
+	return &Task{
+		Config: Config{}.normalized(),
+		Probe: ProbeInfo{
+			Container:         "Matroska",
+			ContainerCapsName: "video/x-matroska",
+			Tracks:            []TrackInfo{{Type: "video", Index: 0, Codec: "H.264", CapsName: codecToCapsName("video", "H.264")}},
+		},
+	}
 }
 
 func newVersionedVideoPipelineRunner(gstVersion float64) *gstRunner {
@@ -694,7 +711,7 @@ func TestStartPipelineUsesActualQueriedSeekPosition(t *testing.T) {
 		return 0
 	}
 	fallbackRunner := &gstRunner{
-		task: &Task{Config: Config{}.normalized()},
+		task: passthroughVideoTask(),
 	}
 	actual, err = fallbackRunner.startPipeline(12)
 	if err != nil {
@@ -919,7 +936,7 @@ func newReusePipelineTestRunner(t *testing.T, queryResult int32, queryPosition i
 	api.gstMiniObjectUnref = func(uintptr) {}
 	gstRuntime = api
 
-	task := &Task{Config: Config{}.normalized()}
+	task := passthroughVideoTask()
 	runner := &gstRunner{
 		task:     task,
 		pipeline: 1,

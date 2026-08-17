@@ -291,11 +291,14 @@ func lastPlaylistURI(t *testing.T, playlist string) string {
 }
 
 func TestHLSBandwidthDoesNotOverflowForLargeFile(t *testing.T) {
+	// Полоса считается по размеру файла только когда поток копируется. Без видеодорожки
+	// копировать нечего, задача считается перекодируемой, и ветка с размером недостижима.
 	task := &Task{
 		Config: Config{}.normalized(),
 		Probe: ProbeInfo{
 			FileSize:   24 * 1024 * 1024 * 1024,
 			DurationNS: int64(2 * time.Hour),
+			Tracks:     []TrackInfo{{Type: "video", Index: 0, Codec: "H.264", CapsName: codecToCapsName("video", "H.264")}},
 		},
 	}
 

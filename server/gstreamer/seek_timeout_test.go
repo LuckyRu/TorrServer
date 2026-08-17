@@ -123,7 +123,7 @@ func TestStartPipelineWaitsOutAnAsyncSeekLikeAPreroll(t *testing.T) {
 		gstMiniObjectUnref: func(uintptr) {},
 	}
 
-	runner := &gstRunner{task: &Task{Config: Config{}.normalized()}}
+	runner := &gstRunner{task: passthroughVideoTask()}
 	actual, err := runner.startPipeline(453.161)
 	if err != nil {
 		t.Fatalf("a seek that only needed more downloading was reported as a failure: %v", err)

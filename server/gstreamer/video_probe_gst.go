@@ -169,9 +169,8 @@ func (r *gstRunner) installVideoSegmentClipProbe(pipeline uintptr, requestedStar
 	if videoIsTranscoded(r.task.Config, r.task.Probe) {
 		pad = gstPipelineElementPad(gstRuntime, pipeline, "video_encoder", "sink")
 	} else {
-		if !r.task.Probe.IsH264() && !r.task.Probe.IsH265() {
-			return
-		}
+		// Без списка кодеков: таймстемпер есть не у всех веток копирования, и отсутствие
+		// элемента уже даёт pad == 0. Свой switch тут только повторял бы videoRemuxChain.
 		pad = gstPipelineElementPad(gstRuntime, pipeline, "video_timestamper", "src")
 	}
 	if pad == 0 {

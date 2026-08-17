@@ -187,9 +187,37 @@ func (t *Task) hasInitMP4() bool {
 	return len(t.initMP4) > 0
 }
 
+// videoRemuxChain — единственное определение «этот кодек можно скопировать»: ветка элементов для
+// passthrough или "", если копировать нечем. videoIsTranscoded и createPipelineArgs читают её же,
+// поэтому «не транскодируем» и «есть чем скопировать» не могут разойтись.
+//
+// Раньше это были два независимых switch, и они разошлись: неизвестный кодек считался
+// копируемым, а ветка для него не писалась — пайплайн собирался без видеодорожки.
+func videoRemuxChain(probe ProbeInfo) string {
+	switch {
+	case probe.IsH264():
+		return "mq.src_0 ! h264parse config-interval=0 ! h264timestamper name=video_timestamper ! video/x-h264,stream-format=avc,alignment=au ! mux.video_0 "
+	case probe.IsH265():
+		return "mq.src_0 ! h265parse config-interval=0 ! h265timestamper name=video_timestamper ! video/x-h265,stream-format=hvc1,alignment=au ! mux.video_0 "
+	case probe.IsAV1():
+		return "mq.src_0 ! av1parse ! video/x-av1,stream-format=obu-stream,alignment=tu ! mux.video_0 "
+	case probe.IsVP9():
+		return "mq.src_0 ! vp9parse ! video/x-vp9,alignment=frame ! mux.video_0 "
+	default:
+		return ""
+	}
+}
+
 // Живёт здесь, а не рядом с построением пайплайна: решение «транскодируем ли видео» нужно и
 // логике задачи, а файл пайплайна собирается только под конкретные платформы.
+//
+// Правило: что не умеем ремуксировать — транскодируем. Флаги TranscodeX выбирают между копией и
+// перекодированием только там, где копия вообще возможна; VP8 и всё, чего нет в videoRemuxChain
+// (MPEG-4 ASP, MPEG-2, VC-1, WMV3, MJPEG), идут через декодер безусловно.
 func videoIsTranscoded(conf Config, probe ProbeInfo) bool {
+	if videoRemuxChain(probe) == "" {
+		return true
+	}
 	if conf.HDRToSDR && probe.Video() != nil && probe.Video().IsHDRVideo() {
 		return true
 	}
@@ -206,7 +234,7 @@ func videoIsTranscoded(conf Config, probe ProbeInfo) bool {
 	case probe.IsVP9():
 		return conf.TranscodeVP9
 	default:
-		return probe.VideoCapsName() != ""
+		return true
 	}
 }
 
