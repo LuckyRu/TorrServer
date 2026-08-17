@@ -473,19 +473,7 @@ func (r *gstRunner) createPipelineArgs() string {
 	if videoIsTranscoded(conf, probe) {
 		r.transcodeToH264(&sb)
 	} else {
-		switch {
-		case probe.IsH264():
-			sb.WriteString("mq.src_0 ! h264parse config-interval=0 ! h264timestamper name=video_timestamper ! video/x-h264,stream-format=avc,alignment=au ! mux.video_0 ")
-
-		case probe.IsH265():
-			sb.WriteString("mq.src_0 ! h265parse config-interval=0 ! h265timestamper name=video_timestamper ! video/x-h265,stream-format=hvc1,alignment=au ! mux.video_0 ")
-
-		case probe.IsAV1():
-			sb.WriteString("mq.src_0 ! av1parse ! video/x-av1,stream-format=obu-stream,alignment=tu ! mux.video_0 ")
-
-		case probe.IsVP9():
-			sb.WriteString("mq.src_0 ! vp9parse ! video/x-vp9,alignment=frame ! mux.video_0 ")
-		}
+		sb.WriteString(videoRemuxChain(probe))
 	}
 
 	if audioTrack := probe.AudioTrack(r.audioIndex); audioTrack != nil {
