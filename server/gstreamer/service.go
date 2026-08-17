@@ -326,22 +326,11 @@ func (s *Service) torrentGate(hash string) *torrentGate {
 	return gate
 }
 
+// Индекс исходника описывает выходной поток только при копировании: под транскодом опорные кадры
+// ставит энкодер. Условие выводится из решения о транскоде, а не повторяет его своим switch —
+// раньше повтор терял HDR→SDR, где индекс тоже не про выходной поток.
 func shouldUseCueTimeline(conf Config, probe ProbeInfo) bool {
-	if !probe.IsMatroskaContainer() {
-		return false
-	}
-	switch {
-	case probe.IsH264():
-		return !conf.TranscodeH264
-	case probe.IsH265():
-		return !conf.TranscodeH265
-	case probe.IsAV1():
-		return !conf.TranscodeAV1
-	case probe.IsVP9():
-		return !conf.TranscodeVP9
-	default:
-		return false
-	}
+	return probe.IsMatroskaContainer() && !videoIsTranscoded(conf, probe)
 }
 
 func (s *Service) evictTasksForLimitLocked(protectedID string) []*Task {
