@@ -152,7 +152,7 @@ func TestWaitForSeekDoneConsumesAsyncDone(t *testing.T) {
 		},
 	}
 
-	done, err := api.waitForSeekDone(1, time.Second)
+	done, err := api.waitForSeekDone(1, time.Second, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,11 +178,60 @@ func TestWaitForSeekDoneTreatsMissingAsyncDoneAsSoftTimeout(t *testing.T) {
 		gstBusTimedPopFiltered: func(uintptr, uint64, int32) uintptr { return 0 },
 	}
 
-	done, err := api.waitForSeekDone(1, time.Millisecond)
+	done, err := api.waitForSeekDone(1, time.Millisecond, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if done {
 		t.Fatal("ASYNC_DONE was reported on timeout")
+	}
+}
+
+// Пайплайн, уже доехавший до целевого состояния, ASYNC_DONE не пришлёт. Раньше ожидание
+// выбирало весь бюджет (45 с на живом возобновлении после паузы), пока плеер отваливался по
+// своему таймауту. Теперь ожидание заканчивается по состоянию.
+func TestWaitForSeekDoneStopsWhenPipelineStateSettles(t *testing.T) {
+	polls := 0
+	api := &gstAPI{
+		gstBusTimedPopFiltered: func(uintptr, uint64, int32) uintptr { return 0 },
+	}
+
+	started := time.Now()
+	done, err := api.waitForSeekDone(1, 30*time.Second, func() bool {
+		polls++
+		return polls >= 2
+	})
+	elapsed := time.Since(started)
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if done {
+		t.Fatal("ASYNC_DONE не приходил, но доложен как полученный")
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("ожидание длилось %v — состояние доехало, а бюджет всё равно выбран", elapsed)
+	}
+	if polls == 0 {
+		t.Fatal("состояние пайплайна ни разу не опрошено")
+	}
+}
+
+// Бюджет остаётся за недоехавшим пайплайном: ранний выход не должен срабатывать, пока состояние
+// держится в ASYNC.
+func TestWaitForSeekDoneKeepsWaitingWhilePipelineIsAsync(t *testing.T) {
+	api := &gstAPI{
+		gstBusTimedPopFiltered: func(uintptr, uint64, int32) uintptr { return 0 },
+	}
+
+	started := time.Now()
+	done, err := api.waitForSeekDone(1, 300*time.Millisecond, func() bool { return false })
+	elapsed := time.Since(started)
+
+	if err != nil || done {
+		t.Fatalf("done=%v err=%v", done, err)
+	}
+	if elapsed < 250*time.Millisecond {
+		t.Fatalf("ожидание оборвалось за %v, хотя пайплайн ещё не доехал", elapsed)
 	}
 }

@@ -276,6 +276,11 @@ type mp4BoxReader struct {
 	targetSegmentStartNS uint64
 	targetSegmentEndNS   uint64
 	targetToleranceNS    uint64
+
+	// Сколько раз реальная опорная граница не совпала с cue-индексом и насколько промахнулась
+	// последняя из них. Счётчик читает раннер, чтобы рассинхрон был виден в логе.
+	cueBoundaryOvershoots  int
+	cueBoundaryOvershootNS uint64
 }
 
 func Mp4BoxReader(onInit func([]byte), onSegment func(Segment), segmentSeconds float64, segmentDiff int, cueMode bool) *mp4BoxReader {
@@ -1084,8 +1089,14 @@ func (r *mp4BoxReader) selectCueVideoCount() (int, error) {
 		if durationNS < targetDuration && targetDuration-durationNS > r.targetToleranceNS {
 			continue
 		}
+		// Индекс Matroska расходится с реальными опорными кадрами чаще, чем хотелось бы: на
+		// живых раздачах встречалось 2.7-8.4 с там, где cue обещал 2.002 с. Отказ здесь означал
+		// бы, что файл не играется вовсе, поэтому режем по настоящему опорному кадру. Перелёт
+		// даёт перекрытие со следующим сегментом, который всё равно перематывается на свою
+		// cue-точку сам; недолёт дал бы дыру, а это для плеера хуже.
 		if durationNS > targetDuration && durationNS-targetDuration > r.targetToleranceNS {
-			return 0, fmt.Errorf("cue sync boundary duration is %d, expected %d", durationNS, targetDuration)
+			r.cueBoundaryOvershootNS = durationNS - targetDuration
+			r.cueBoundaryOvershoots++
 		}
 		return i, nil
 	}

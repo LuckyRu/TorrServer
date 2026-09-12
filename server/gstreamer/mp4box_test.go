@@ -706,3 +706,73 @@ func TestAddTfdtOffsetOverflow(t *testing.T) {
 		t.Fatal("expected overflow error")
 	}
 }
+
+// Индекс Matroska не всегда совпадает с реальными опорными кадрами: на живых раздачах cue обещал
+// сегменты по 2.002 с, а поток отдавал границы на 2.7-8.4 с. Раньше это было ошибкой, и файл не
+// играл вовсе; теперь режем по настоящему кадру и только считаем промах.
+func newCueTestReader(t *testing.T, boundaryMS uint64) *mp4BoxReader {
+	t.Helper()
+	reader := Mp4BoxReader(func([]byte) {}, func(Segment) {}, 6, 0, true)
+	reader.videoTrack = trackInfo{id: 1, timescale: 1000, trex: trexInfo{descriptionIndex: 1}}
+	reader.video = []mp4Fragment{
+		testFragment(1, 1000, 0, 1000, 3, true, 0x01),
+		testFragment(1, 1000, boundaryMS, 1000, 3, true, 0x02),
+	}
+	if err := reader.SetTargetSegment(0, 2_002_000_000, 1_000_000); err != nil {
+		t.Fatalf("SetTargetSegment: %v", err)
+	}
+	return reader
+}
+
+func TestCueBoundaryOvershootCutsAtRealKeyframe(t *testing.T) {
+	for _, boundaryMS := range []uint64{2711, 2836, 8383} {
+		reader := newCueTestReader(t, boundaryMS)
+
+		count, err := reader.selectCueVideoCount()
+		if err != nil {
+			t.Fatalf("граница %d мс: рассинхрон индекса отказал в сегменте: %v", boundaryMS, err)
+		}
+		if count != 1 {
+			t.Fatalf("граница %d мс: count=%d, want 1", boundaryMS, count)
+		}
+		if reader.cueBoundaryOvershoots != 1 {
+			t.Fatalf("граница %d мс: промах не посчитан (%d)", boundaryMS, reader.cueBoundaryOvershoots)
+		}
+		wantNS := boundaryMS*1_000_000 - 2_002_000_000
+		if reader.cueBoundaryOvershootNS != wantNS {
+			t.Fatalf("граница %d мс: промах %d нс, want %d", boundaryMS, reader.cueBoundaryOvershootNS, wantNS)
+		}
+	}
+}
+
+func TestCueBoundaryWithinToleranceIsNotReportedAsMismatch(t *testing.T) {
+	reader := newCueTestReader(t, 2002)
+
+	count, err := reader.selectCueVideoCount()
+	if err != nil {
+		t.Fatalf("совпавшая граница отказала: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("count=%d, want 1", count)
+	}
+	if reader.cueBoundaryOvershoots != 0 {
+		t.Fatalf("совпавшая граница посчитана промахом (%d)", reader.cueBoundaryOvershoots)
+	}
+}
+
+// Недолёт по-прежнему копит фрагменты, а не режет раньше времени: дыра между сегментами для
+// плеера хуже перекрытия, потому что следующий сегмент перематывается на свою cue-точку сам.
+func TestCueBoundaryShorterThanTargetKeepsAccumulating(t *testing.T) {
+	reader := newCueTestReader(t, 900)
+
+	count, err := reader.selectCueVideoCount()
+	if err != nil {
+		t.Fatalf("недолёт отказал: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("count=%d, want 0 (ждём следующий фрагмент)", count)
+	}
+	if reader.cueBoundaryOvershoots != 0 {
+		t.Fatalf("недолёт посчитан промахом (%d)", reader.cueBoundaryOvershoots)
+	}
+}

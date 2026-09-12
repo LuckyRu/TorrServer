@@ -377,7 +377,11 @@ func (g *gstAPI) drainBusMessages(bus uintptr, messageTypes int32) {
 	}
 }
 
-func (g *gstAPI) waitForSeekDone(bus uintptr, timeout time.Duration) (bool, error) {
+// settled, когда задан, опрашивается между чтениями шины: пайплайн, уже доехавший до целевого
+// состояния, ASYNC_DONE больше не пришлёт, и ожидание полного бюджета ради сообщения, которое не
+// придёт, стоило 45 с на живом возобновлении — плеер за это время сдался трижды. Ранний выход
+// безопасен: следом идёт awaitPreroll, который ждёт по состоянию и переловит недоехавший пайплайн.
+func (g *gstAPI) waitForSeekDone(bus uintptr, timeout time.Duration, settled func() bool) (bool, error) {
 	if bus == 0 || g.gstBusTimedPopFiltered == nil {
 		return false, errors.New("gstreamer bus is not available while waiting for seek")
 	}
@@ -401,6 +405,9 @@ func (g *gstAPI) waitForSeekDone(bus uintptr, timeout time.Duration) (bool, erro
 		wait := min(remaining, 100*time.Millisecond)
 		if g.popBusMessage(bus, wait, gstMessageAsyncDone) {
 			return true, nil
+		}
+		if settled != nil && settled() {
+			break
 		}
 	}
 
