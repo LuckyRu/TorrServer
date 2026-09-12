@@ -53,7 +53,10 @@ type gstRunner struct {
 	audioIndex int
 
 	statePlaying bool
-	readySegment struct {
+	// Рассинхрон cue-индекса с реальными опорными кадрами логируется один раз на задачу:
+	// он повторяется на каждом сегменте файла и иначе залил бы лог.
+	loggedCueMismatch bool
+	readySegment      struct {
 		index    int
 		complete bool
 		segment  Segment
@@ -791,7 +794,7 @@ func (r *gstRunner) reusePipeline(seconds float64, accurate bool, waitTimeout ti
 	if err := sendVideoSeekEvent(r.pipeline, flags, seekNS); err != nil {
 		return 0, fmt.Errorf("gstreamer seek failed while reusing pipeline: %w", err)
 	}
-	asyncDone, err := gstRuntime.waitForSeekDone(r.bus, waitTimeout)
+	asyncDone, err := gstRuntime.waitForSeekDone(r.bus, waitTimeout, r.pipelineSettled(r.pipeline))
 	if err != nil {
 		return 0, fmt.Errorf("gstreamer seek did not finish while reusing pipeline: %w", err)
 	}
@@ -999,6 +1002,7 @@ func (r *gstRunner) GetSegment(ctx context.Context, index int, audio int) (Segme
 		}
 
 		if r.readySegment.complete {
+			r.reportCueBoundaryMismatch()
 			return r.completeReadySegment(index), nil
 		}
 	}
@@ -1009,6 +1013,17 @@ func (r *gstRunner) GetSegment(ctx context.Context, index int, audio int) (Segme
 	}
 
 	return Segment{}, ErrSegmentNotReady
+}
+
+// Индекс расходится с потоком — сегменты режутся по настоящим опорным кадрам и выходят длиннее
+// заявленных в плейлисте. Воспроизведение продолжается, но это стоит видеть в логе.
+func (r *gstRunner) reportCueBoundaryMismatch() {
+	if r.loggedCueMismatch || r.reader == nil || r.reader.cueBoundaryOvershoots == 0 {
+		return
+	}
+	r.loggedCueMismatch = true
+	gstTaskDebugf(r.task, "cue index disagrees with stream keyframes: %d segments cut late, last by %.3fs",
+		r.reader.cueBoundaryOvershoots, float64(r.reader.cueBoundaryOvershootNS)/1_000_000_000)
 }
 
 func (r *gstRunner) pullOutputSample() (bool, error) {
@@ -1383,7 +1398,7 @@ func (r *gstRunner) startPipeline(seconds float64) (float64, error) {
 		}
 		// Same budget as reusePipeline's seek: this path is the one taken after the pipeline
 		// died, so the position is at its coldest and the wait is on the swarm, not on a disk.
-		asyncDone, err := gstRuntime.waitForSeekDone(bus, pipelinePrerollTimeout)
+		asyncDone, err := gstRuntime.waitForSeekDone(bus, pipelinePrerollTimeout, r.pipelineSettled(pipeline))
 		if err != nil {
 			cleanup()
 			return 0, fmt.Errorf("gstreamer seek did not finish: %w", err)
@@ -1442,6 +1457,17 @@ func (r *gstRunner) startPipeline(seconds float64) (float64, error) {
 // the viewer navigated away - stops waiting on a swarm nobody is listening to, and so that
 // a genuine failure, which arrives on the bus rather than as a state result, surfaces
 // straight away instead of sitting out the whole deadline.
+// pipelineSettled сообщает, что состояние уже доехало: ровно тот признак, по которому
+// awaitPreroll заканчивает ожидание, только без блокирующего опроса.
+func (r *gstRunner) pipelineSettled(pipeline uintptr) func() bool {
+	return func() bool {
+		if gstRuntime == nil || pipeline == 0 {
+			return false
+		}
+		return gstRuntime.elementGetState(pipeline, 0) != gstStateChangeAsync
+	}
+}
+
 func (r *gstRunner) awaitPreroll(pipeline uintptr, bus uintptr) (int32, error) {
 	deadline := time.Now().Add(pipelinePrerollTimeout)
 	for {
