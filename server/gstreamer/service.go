@@ -59,6 +59,9 @@ type Service struct {
 
 	clients clientRegistry
 
+	expiredMu sync.Mutex
+	expired   map[string]expiredSession
+
 	cleanupRunning atomic.Bool
 	disposed       atomic.Bool
 	stopCleanup    chan struct{}
@@ -71,6 +74,15 @@ const (
 	// make room would be visible as a stall. Past the limit with nothing older than this,
 	// the honest answer is to refuse the newcomer.
 	sessionActiveGrace = 15 * time.Second
+
+	// Замороженная задача не держит ни пайплайна, ни читателя торрента — только метаданные, — а
+	// её удаление делает мёртвыми все ссылки плеера: в них зашит токен сессии, и вернувшийся с
+	// паузы плеер получает 404 без шанса восстановиться. Слоты это не занимает: при нехватке
+	// места вытесняется самая давно неактивная задача.
+	frozenSessionRetention = 24 * time.Hour
+
+	// Сколько удалённых сессий помнить, чтобы возврат плеера по устаревшим ссылкам попал в лог.
+	maxExpiredSessions = 64
 
 	cueCacheTTL         = probeCacheTTL
 	cueNegativeCacheTTL = time.Minute
@@ -175,7 +187,7 @@ func (s *Service) getOrAdd(ctx context.Context, token string, client string, has
 	}
 	cue := s.cueTimeline(ctx, conf, hash, fileID, sourceURL, probe)
 
-	task, err := NewTask(token, hash, client, fileID, audio, sourceURL, probe, cue, conf)
+	task, err := newSessionTask(token, hash, client, fileID, audio, sourceURL, probe, cue, conf)
 	if err != nil {
 		return nil, err
 	}
@@ -347,6 +359,7 @@ func (s *Service) evictTasksForLimitLocked(protectedID string) []*Task {
 		}
 		delete(s.tasks, id)
 		if task != nil {
+			s.rememberExpired(id, task, "task limit")
 			evicted = append(evicted, task)
 		}
 	}
@@ -439,6 +452,10 @@ func (s *Service) Probe(hash string, fileID string) (ProbeInfo, error) {
 	s.setCachedProbe(hash, fileID, probe)
 	return probe, nil
 }
+
+// newSessionTask is a seam: restoring a removed session goes through GetOrAdd, and a test has to
+// see which session it builds without starting a real GStreamer runtime.
+var newSessionTask = NewTask
 
 // readCueTimeline is a seam: the shared cue read is what a test needs to hold still while it
 // checks that one caller going away does not fail the others.
@@ -912,8 +929,88 @@ func (s *Service) tryRemoveExpectedInactive(id string, expected *Task, cutoff ti
 	delete(s.tasks, id)
 	s.mu.Unlock()
 
+	s.rememberExpired(id, task, "inactivity")
 	task.Dispose()
 	return true
+}
+
+type expiredSession struct {
+	client    string
+	hash      string
+	fileID    string
+	audio     int
+	reason    string
+	removedAt time.Time
+	reported  bool
+}
+
+// rememberExpired оставляет надгробие сессии, которую сервер убрал сам. Токен детерминирован
+// (client+hash+file+audio), поэтому по надгробию сессию можно поднять под тем же токеном, когда
+// плеер вернётся по старым ссылкам.
+func (s *Service) rememberExpired(token string, task *Task, reason string) {
+	if token == "" || task == nil {
+		return
+	}
+	s.expiredMu.Lock()
+	defer s.expiredMu.Unlock()
+	if s.expired == nil || len(s.expired) >= maxExpiredSessions {
+		s.expired = make(map[string]expiredSession)
+	}
+	s.expired[token] = expiredSession{
+		client:    task.ClientID,
+		hash:      task.Hash,
+		fileID:    task.FileID,
+		audio:     task.Audio,
+		reason:    reason,
+		removedAt: time.Now().UTC(),
+	}
+}
+
+// lookupExpired не удаляет надгробие: плеер после паузы шлёт плейлист, init и сегмент разом, и
+// все они должны найти, из чего поднять сессию. firstReport — чтобы в лог попала одна строка.
+func (s *Service) lookupExpired(token string) (session expiredSession, ok bool, firstReport bool) {
+	s.expiredMu.Lock()
+	defer s.expiredMu.Unlock()
+	session, ok = s.expired[token]
+	if !ok {
+		return session, false, false
+	}
+	firstReport = !session.reported
+	session.reported = true
+	s.expired[token] = session
+	return session, true, firstReport
+}
+
+func (s *Service) forgetExpired(token string) {
+	s.expiredMu.Lock()
+	defer s.expiredMu.Unlock()
+	delete(s.expired, token)
+}
+
+// restoreExpiredSession поднимает убранную сессию под прежним токеном. Без этого плеер,
+// вернувшийся с долгой паузы, получал 404 из resolveTask, не оставив в логе ни строки, и дальше
+// не восстанавливался: все его ссылки несут токен, которого больше нет.
+func (s *Service) restoreExpiredSession(ctx context.Context, hash string, token string) (*Task, error) {
+	expired, ok, firstReport := s.lookupExpired(token)
+	if !ok || expired.hash != hash {
+		return nil, nil
+	}
+	if firstReport {
+		gstWarnf("hash=%s file=%s session=%s returned %s after removal (%s); restoring the session",
+			expired.hash, expired.fileID, token, time.Since(expired.removedAt).Round(time.Second), expired.reason)
+	}
+	task, err := s.GetOrAdd(ctx, expired.client, expired.hash, expired.fileID, expired.audio)
+	if err != nil {
+		// Надгробие остаётся: отказ бывает временным (все слоты заняты играющими), и повтор
+		// плеера после Retry-After должен найти, из чего поднять сессию.
+		gstSourceFailure(expired.client, expired.hash, expired.fileID, expired.audio, "session restore", err)
+		return nil, err
+	}
+	if task.Token != token {
+		return nil, nil
+	}
+	s.forgetExpired(token)
+	return task, nil
 }
 
 func (s *Service) Dispose() {
@@ -987,7 +1084,7 @@ func (s *Service) cleanupInactive() {
 
 	conf := s.currentConfig()
 	inactiveDuration := conf.inactiveDuration()
-	removeAfter := inactiveDuration + 20*time.Minute
+	removeAfter := inactiveDuration + frozenSessionRetention
 	freezeCutoff := now.Add(-inactiveDuration)
 	removeCutoff := now.Add(-removeAfter)
 
