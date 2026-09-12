@@ -41,18 +41,40 @@ func (s *Service) SetupRoute(route gin.IRouter) {
 }
 
 // resolveTask finds the session a request belongs to.
-func (s *Service) resolveTask(c *gin.Context) *Task {
+func (s *Service) resolveTask(c *gin.Context) (*Task, error) {
 	hash := c.Param("hash")
 	token := c.Param("token")
 	if token == "" {
-		return s.soleSessionForHash(hash)
+		return s.soleSessionForHash(hash), nil
 	}
 
-	task := s.session(token)
-	if task == nil || task.Hash != hash {
+	return s.resolveSession(c.Request.Context(), hash, token)
+}
+
+// requireTask отвечает клиенту сам, если сессии нет. Отказ восстановления — не 404: при занятых
+// слотах это 503 с Retry-After, и плеер повторит, а 404 для него окончательный.
+func (s *Service) requireTask(c *gin.Context) *Task {
+	task, err := s.resolveTask(c)
+	if task != nil {
+		return task
+	}
+	if err != nil {
+		abortWithSourceError(c, err)
 		return nil
 	}
-	return task
+	c.Status(http.StatusNotFound)
+	return nil
+}
+
+func (s *Service) resolveSession(ctx context.Context, hash string, token string) (*Task, error) {
+	task := s.session(token)
+	if task == nil {
+		return s.restoreExpiredSession(ctx, hash, token)
+	}
+	if task.Hash != hash {
+		return nil, nil
+	}
+	return task, nil
 }
 
 func (s *Service) remove(c *gin.Context) {
@@ -146,9 +168,8 @@ func (s *Service) master(c *gin.Context) {
 
 func (s *Service) videoPlaylist(c *gin.Context) {
 	noCache(c)
-	task := s.resolveTask(c)
+	task := s.requireTask(c)
 	if task == nil {
-		c.Status(http.StatusNotFound)
 		return
 	}
 	audio := parseQueryInt(c, "audio", task.Audio)
@@ -370,9 +391,8 @@ func buildTaskPlaylist(task *Task, startIndex int, audio int) string {
 func (s *Service) initMP4(c *gin.Context) {
 	noCache(c)
 
-	task := s.resolveTask(c)
+	task := s.requireTask(c)
 	if task == nil {
-		c.Status(http.StatusNotFound)
 		return
 	}
 
@@ -401,9 +421,8 @@ func (s *Service) initMP4(c *gin.Context) {
 func (s *Service) segment(c *gin.Context) {
 	noCache(c)
 
-	task := s.resolveTask(c)
+	task := s.requireTask(c)
 	if task == nil {
-		c.Status(http.StatusNotFound)
 		return
 	}
 
@@ -439,9 +458,8 @@ func (s *Service) segment(c *gin.Context) {
 
 func (s *Service) subtitle(c *gin.Context) {
 	noCache(c)
-	task := s.resolveTask(c)
+	task := s.requireTask(c)
 	if task == nil {
-		c.Status(http.StatusNotFound)
 		return
 	}
 	path := strings.TrimPrefix(c.Param("subtitle"), "/")
