@@ -2030,7 +2030,14 @@ func normalizeTrun(
 	hasCompositionOffsets := flags&trunCompositionTimeOffsetPresent != 0
 
 	if !hasDuration && defaultDuration == 0 {
-		return run, errors.New("sample duration is absent")
+		// mp4mux не знает длительность последнего сэмпла до прихода следующего и пишет ноль, а
+		// подсказку взять неоткуда сразу после сброса ридера. Одиночному сэмплу достаточно
+		// временного значения: фрагмент не уходит в сегмент, пока tfdt следующего его не уточнит.
+		if sampleCount != 1 {
+			return run, errors.New("sample duration is absent")
+		}
+		defaultDuration = 1
+		defaultDurationIsHint = true
 	}
 	if !hasSize && defaultSize == 0 {
 		return run, errors.New("sample size is absent")
