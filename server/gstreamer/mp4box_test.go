@@ -776,3 +776,57 @@ func TestCueBoundaryShorterThanTargetKeepsAccumulating(t *testing.T) {
 		t.Fatalf("недолёт посчитан промахом (%d)", reader.cueBoundaryOvershoots)
 	}
 }
+
+// mp4mux пишет фрагмент из одного сэмпла без длительности: её он узнаёт только из следующего
+// буфера. Сразу после перемотки подсказки ещё нет, и раньше такой фрагмент рвал сегмент
+// ошибкой «sample duration is absent» — на живом DV WEB-DL перемотка не работала вовсе.
+func testSourceMoof(trackID uint32, decodeTime uint64, sampleSize uint32) []byte {
+	tfhd := testFullBox(boxTfhd, tfhdDefaultBaseIsMoof|tfhdSampleDescriptionIndexPresent, testU32(trackID, 1))
+	tfdtBody := make([]byte, 8)
+	binary.BigEndian.PutUint64(tfdtBody, decodeTime)
+	tfdt := testFullBox(boxTfdt, 1<<24, tfdtBody)
+	trun := testFullBox(boxTrun, trunSampleSizePresent, testU32(1, sampleSize))
+	return testBox(boxMoof, testBox(boxTraf, tfhd, tfdt, trun))
+}
+
+func TestFirstFragmentWithoutDurationIsResolvedByTheNextOne(t *testing.T) {
+	reader := Mp4BoxReader(func([]byte) {}, func(Segment) {}, 6, 0, true)
+	reader.videoTrack = trackInfo{id: 1, timescale: 90000, trex: trexInfo{descriptionIndex: 1}}
+
+	var first mp4Fragment
+	if err := parseSourceMoof(testSourceMoof(1, 900000, 100), reader.videoTrack, trackInfo{}, 0, 0, &first); err != nil {
+		t.Fatalf("первый фрагмент после сброса без длительности отвергнут: %v", err)
+	}
+	if !first.hasInferredDuration {
+		t.Fatal("временная длительность не помечена как требующая уточнения")
+	}
+	reader.video = append(reader.video, first)
+
+	var next mp4Fragment
+	if err := parseSourceMoof(testSourceMoof(1, 903754, 100), reader.videoTrack, trackInfo{}, 0, 0, &next); err != nil {
+		t.Fatalf("второй фрагмент: %v", err)
+	}
+	if err := reader.resolvePreviousInferredDuration(&next); err != nil {
+		t.Fatalf("уточнение: %v", err)
+	}
+
+	resolved := reader.video[0]
+	if resolved.hasInferredDuration {
+		t.Fatal("длительность первого фрагмента так и осталась временной")
+	}
+	if resolved.duration != 3754 {
+		t.Fatalf("длительность=%d, want 3754 — разница tfdt соседних фрагментов", resolved.duration)
+	}
+	if reader.videoSampleDurationHint != 3754 {
+		t.Fatalf("подсказка=%d, want 3754 — дальше она должна работать без временных значений", reader.videoSampleDurationHint)
+	}
+}
+
+// Для нескольких сэмплов временное значение исказило бы все, кроме последнего: уточняется
+// только он. Такой фрагмент по-прежнему отвергается, а не молча портит таймлайн.
+func TestMultiSampleRunWithoutDurationIsStillRejected(t *testing.T) {
+	box := testFullBox(boxTrun, trunSampleSizePresent, testU32(2, 100, 100))
+	if _, err := normalizeTrun(box, 8, 0, 0, 0, false); err == nil || !strings.Contains(err.Error(), "sample duration is absent") {
+		t.Fatalf("error=%v, want «sample duration is absent»", err)
+	}
+}
