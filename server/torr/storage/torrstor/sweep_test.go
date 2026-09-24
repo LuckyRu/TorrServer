@@ -276,6 +276,39 @@ func TestSweepIsSafeAgainstReadersBeingServed(t *testing.T) {
 	}
 }
 
+// A piece the torrent client is still downloading is evicted only after every complete one,
+// even when it is older. The client keeps counting the chunks it already received, so a
+// responsive reader returning to that spot was served zeros where they had been.
+func TestSweepEvictsDownloadingPiecesLast(t *testing.T) {
+	fixture := newSweepFixture(t, withPieces(256, 0), withReader(60<<20, 0))
+	// 72 MB against a 64 MB cache. The reader's window covers pieces 28..92 and the file
+	// head 0..7 is kept anyway, so 8..27 are the candidates and 8, 9 the oldest of them.
+	downloading := []int{8, 9}
+	for id := 8; id < 80; id++ {
+		piece := fixture.cache.pieces[id]
+		piece.mPiece = NewMemPiece(piece)
+		piece.Size.Store(1 << 20)
+		piece.Complete.Store(!slices.Contains(downloading, id))
+	}
+
+	fixture.cache.cleanPieces()
+
+	evicted := 0
+	for _, piece := range fixture.cache.pieces {
+		if piece.mPiece != nil && piece.Size.Load() == 0 {
+			evicted++
+		}
+	}
+	if evicted == 0 {
+		t.Fatal("the cache was over capacity and nothing was evicted")
+	}
+	for _, id := range downloading {
+		if fixture.cache.pieces[id].Size.Load() == 0 {
+			t.Fatalf("piece %d was still downloading and was evicted while %d complete pieces could go instead", id, 20-len(downloading))
+		}
+	}
+}
+
 // A piece inside any active reader's window is not evictable. That is what keeps one viewer's
 // buffer from being thrown away by another viewer's sweep.
 func TestSweepKeepsPiecesInsideAReadersWindow(t *testing.T) {
